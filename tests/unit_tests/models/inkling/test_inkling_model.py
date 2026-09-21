@@ -70,6 +70,27 @@ def test_sparse_layers_use_inkling_moe():
             assert isinstance(layer.mlp, InklingDenseMLP)
 
 
+def test_inkling_small_checkpoint_widths_produce_matching_parameter_shapes():
+    config_dict = build_tiny_config().to_dict()
+    config_dict["text_config"].update(
+        {
+            "intermediate_size": 32,
+            "dense_intermediate_size": 96,
+        }
+    )
+    config_dict["text_config"].pop("moe_intermediate_size")
+    cfg = InklingConfig.from_dict(config_dict)
+    backend = BackendConfig(linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
+    model = InklingForConditionalGeneration.from_config(cfg, backend=backend)
+    state_dict = model.state_dict_adapter.to_hf(model.state_dict())
+
+    assert state_dict["model.llm.layers.0.mlp.w13_dn.weight"].shape == (192, 64)
+    assert state_dict["model.llm.layers.2.mlp.experts.w13_weight"].shape == (8, 64, 64)
+    assert state_dict["model.llm.layers.2.mlp.experts.w2_weight"].shape == (8, 64, 32)
+    assert state_dict["model.llm.layers.2.mlp.shared_experts.shared_w13_weight"].shape == (2, 64, 64)
+    assert state_dict["model.llm.layers.2.mlp.shared_experts.shared_w2_weight"].shape == (2, 64, 32)
+
+
 def test_pretrained_load_skips_redundant_full_model_initialization():
     assert InklingForConditionalGeneration._skip_init_weights_on_load is True
 

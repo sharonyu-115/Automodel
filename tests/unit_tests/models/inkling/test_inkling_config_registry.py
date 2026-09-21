@@ -53,6 +53,44 @@ def test_inkling_checkpoint_aliases_and_placeholder_defaults():
     assert cfg.audio_config.text_hidden_size == 64
 
 
+def test_inkling_small_checkpoint_preserves_separate_dense_and_moe_widths():
+    cfg = InklingConfig.from_dict(
+        {
+            "model_type": "inkling_mm_model",
+            "text_config": {
+                "intermediate_size": 2048,
+                "dense_intermediate_size": 16384,
+            },
+        }
+    )
+
+    assert cfg.text_config.intermediate_size == 16384
+    assert cfg.text_config.moe_intermediate_size == 2048
+
+
+def test_inkling_checkpoint_explicit_moe_width_takes_precedence():
+    cfg = InklingConfig.from_dict(
+        {
+            "model_type": "inkling_mm_model",
+            "text_config": {
+                "intermediate_size": 2048,
+                "dense_intermediate_size": 16384,
+                "moe_intermediate_size": 1024,
+            },
+        }
+    )
+
+    assert cfg.text_config.intermediate_size == 16384
+    assert cfg.text_config.moe_intermediate_size == 1024
+
+
+def test_inkling_checkpoint_without_dense_width_keeps_full_model_defaults():
+    cfg = InklingConfig.from_dict({"model_type": "inkling_mm_model", "text_config": {}})
+
+    assert cfg.text_config.intermediate_size == 24576
+    assert cfg.text_config.moe_intermediate_size == 3072
+
+
 def test_inkling_architecture_instantiates_from_local_config():
     assert ModelRegistry.has_custom_model("InklingForConditionalGeneration")
     backend = BackendConfig(linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
