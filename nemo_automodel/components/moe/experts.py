@@ -40,10 +40,10 @@ from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 
 # ── EP variable-length collective helpers ──
 
-# Keep each BF16 EP collective at or below 32 MiB. Larger collectives can
+# Keep each BF16 EP collective at or below 8 MiB. Larger collectives can
 # indefinitely stall on multi-node GB200 process groups even when NCCL's input
 # count is below its integer limit.
-_MAX_EP_COLLECTIVE_NUMEL = 1 << 24
+_MAX_EP_COLLECTIVE_NUMEL = 1 << 22
 
 
 def _wait_for_collective(work: dist.Work, device: torch.device) -> None:
