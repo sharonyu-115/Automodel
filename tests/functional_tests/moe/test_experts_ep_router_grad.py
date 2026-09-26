@@ -34,6 +34,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
+import nemo_automodel.components.moe.experts as experts_module
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, _ReduceScatterVarlenFn
 
@@ -148,6 +149,9 @@ def _reduce_scatter_worker(rank: int, world_size: int, port: int) -> None:
         os.environ["MASTER_PORT"] = str(port)
         dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
+        # Force multiple feature chunks with a tiny tensor so this test covers
+        # the bounded NCCL-count path used by long EP128 sequences.
+        experts_module._MAX_EP_COLLECTIVE_NUMEL = 12
         first_chunk = torch.full((3, 4), float(rank + 1))
         second_chunk = torch.full((2, 4), float(10 * (rank + 1)))
         leaf = torch.cat([first_chunk, second_chunk]).requires_grad_(True)

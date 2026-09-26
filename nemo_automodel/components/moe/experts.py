@@ -40,6 +40,62 @@ from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 
 # ── EP variable-length collective helpers ──
 
+_MAX_EP_COLLECTIVE_NUMEL = 1 << 27
+
+
+def _reduce_scatter_rank_major(tensor: torch.Tensor, group: dist.ProcessGroup, world_size: int) -> torch.Tensor:
+    """Reduce-scatter a rank-major tensor in bounded feature chunks.
+
+    Args:
+        tensor: Contiguous tensor of shape [world_size * local_tokens, ...], with rank-major token slices and
+            arbitrary trailing feature dimensions.
+        group: Expert-parallel process group of size ``world_size``.
+        world_size: Number of ranks in ``group``.
+
+    Returns:
+        Tensor of shape [local_tokens, ...] containing this rank's reduced token slice.
+    """
+    total_rows = tensor.shape[0]
+    if total_rows % world_size != 0:
+        raise ValueError(f"Expected {total_rows=} to be divisible by {world_size=}")
+
+    local_rows = total_rows // world_size
+    flat = tensor.reshape(total_rows, -1)
+    local_flat = torch.empty((local_rows, flat.shape[1]), dtype=tensor.dtype, device=tensor.device)
+    features_per_chunk = max(1, _MAX_EP_COLLECTIVE_NUMEL // total_rows)
+    for start in range(0, flat.shape[1], features_per_chunk):
+        end = min(start + features_per_chunk, flat.shape[1])
+        input_chunk = flat[:, start:end].contiguous()
+        output_chunk = torch.empty((local_rows, end - start), dtype=tensor.dtype, device=tensor.device)
+        dist.reduce_scatter_tensor(output_chunk, input_chunk, op=dist.ReduceOp.SUM, group=group)
+        local_flat[:, start:end].copy_(output_chunk)
+    return local_flat.reshape((local_rows,) + tuple(tensor.shape[1:]))
+
+
+def _all_gather_rank_major(local_tensor: torch.Tensor, group: dist.ProcessGroup, world_size: int) -> torch.Tensor:
+    """All-gather a rank-local tensor in bounded feature chunks.
+
+    Args:
+        local_tensor: Contiguous tensor of shape [local_tokens, ...], with arbitrary trailing feature dimensions.
+        group: Expert-parallel process group of size ``world_size``.
+        world_size: Number of ranks in ``group``.
+
+    Returns:
+        Tensor of shape [world_size * local_tokens, ...], ordered as the concatenation of rank-local token slices.
+    """
+    local_rows = local_tensor.shape[0]
+    flat = local_tensor.reshape(local_rows, -1)
+    total_rows = world_size * local_rows
+    gathered_flat = torch.empty((total_rows, flat.shape[1]), dtype=local_tensor.dtype, device=local_tensor.device)
+    features_per_chunk = max(1, _MAX_EP_COLLECTIVE_NUMEL // total_rows)
+    for start in range(0, flat.shape[1], features_per_chunk):
+        end = min(start + features_per_chunk, flat.shape[1])
+        input_chunk = flat[:, start:end].contiguous()
+        output_chunk = torch.empty((total_rows, end - start), dtype=local_tensor.dtype, device=local_tensor.device)
+        dist.all_gather_into_tensor(output_chunk, input_chunk, group=group)
+        gathered_flat[:, start:end].copy_(output_chunk)
+    return gathered_flat.reshape((total_rows,) + tuple(local_tensor.shape[1:]))
+
 
 class _AllGatherConcatVarlenFn(Function):
     """All-gather with variable local lengths and autograd-safe backward.
@@ -104,10 +160,7 @@ class _AllGatherConcatVarlenFn(Function):
                 padded_chunks.append(chunk)
             scatter_input = torch.cat(padded_chunks, dim=0)
 
-        grad_padded = torch.empty(
-            (ctx.max_len,) + tuple(grad_output.shape[1:]), dtype=grad_output.dtype, device=grad_output.device
-        )
-        dist.reduce_scatter_tensor(grad_padded, scatter_input, op=dist.ReduceOp.SUM, group=ctx.group)
+        grad_padded = _reduce_scatter_rank_major(scatter_input, ctx.group, len(ctx.gathered_lens))
         grad_local = grad_padded.narrow(0, 0, local_len).contiguous()
         return grad_local, None, None, None
 
@@ -149,8 +202,7 @@ class _ReduceScatterVarlenFn(Function):
                 padded_chunks.append(chunk)
             scatter_input = torch.cat(padded_chunks, dim=0)
 
-        local_padded = torch.empty((max_len,) + tuple(tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device)
-        dist.reduce_scatter_tensor(local_padded, scatter_input, op=dist.ReduceOp.SUM, group=group)
+        local_padded = _reduce_scatter_rank_major(scatter_input, group, len(gathered_lens))
         return local_padded.narrow(0, 0, gathered_lens[ctx.rank]).contiguous()
 
     @staticmethod
@@ -173,12 +225,7 @@ class _ReduceScatterVarlenFn(Function):
         else:
             grad_padded = grad_output.contiguous()
 
-        gathered = torch.empty(
-            (len(ctx.gathered_lens) * ctx.max_len,) + tuple(grad_output.shape[1:]),
-            dtype=grad_output.dtype,
-            device=grad_output.device,
-        )
-        dist.all_gather_into_tensor(gathered, grad_padded, group=ctx.group)
+        gathered = _all_gather_rank_major(grad_padded, ctx.group, len(ctx.gathered_lens))
         if all(length == ctx.max_len for length in ctx.gathered_lens):
             grad_input = gathered
         else:
