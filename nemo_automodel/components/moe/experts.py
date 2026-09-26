@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -46,6 +47,14 @@ from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 _MAX_EP_COLLECTIVE_NUMEL = 1 << 24
 
 
+def _wait_for_collective(work: dist.Work, device: torch.device) -> None:
+    """Wait for one collective without synchronizing unrelated CUDA streams."""
+    if device.type == "cuda":
+        while not work.is_completed():
+            time.sleep(0.001)
+    work.wait()
+
+
 def _reduce_scatter_rank_major(tensor: torch.Tensor, group: dist.ProcessGroup, world_size: int) -> torch.Tensor:
     """Reduce-scatter a rank-major tensor in bounded feature chunks.
 
@@ -70,13 +79,9 @@ def _reduce_scatter_rank_major(tensor: torch.Tensor, group: dist.ProcessGroup, w
         end = min(start + features_per_chunk, flat.shape[1])
         input_chunk = flat[:, start:end].contiguous()
         output_chunk = torch.empty((local_rows, end - start), dtype=tensor.dtype, device=tensor.device)
-        dist.reduce_scatter_tensor(output_chunk, input_chunk, op=dist.ReduceOp.SUM, group=group)
+        work = dist.reduce_scatter_tensor(output_chunk, input_chunk, op=dist.ReduceOp.SUM, group=group, async_op=True)
+        _wait_for_collective(work, tensor.device)
         local_flat[:, start:end].copy_(output_chunk)
-        if tensor.is_cuda:
-            # ProcessGroupNCCL runs collectives on a dedicated stream. Drain it
-            # after every chunk so a stalled operation cannot accumulate a
-            # layer's remaining chunks behind it for most of the watchdog age.
-            torch.cuda.synchronize(tensor.device)
     return local_flat.reshape((local_rows,) + tuple(tensor.shape[1:]))
 
 
@@ -100,12 +105,9 @@ def _all_gather_rank_major(local_tensor: torch.Tensor, group: dist.ProcessGroup,
         end = min(start + features_per_chunk, flat.shape[1])
         input_chunk = flat[:, start:end].contiguous()
         output_chunk = torch.empty((total_rows, end - start), dtype=local_tensor.dtype, device=local_tensor.device)
-        dist.all_gather_into_tensor(output_chunk, input_chunk, group=group)
+        work = dist.all_gather_into_tensor(output_chunk, input_chunk, group=group, async_op=True)
+        _wait_for_collective(work, local_tensor.device)
         gathered_flat[:, start:end].copy_(output_chunk)
-        if local_tensor.is_cuda:
-            # See _reduce_scatter_rank_major: bound both the collective size
-            # and queue depth in the inverse autograd operation as well.
-            torch.cuda.synchronize(local_tensor.device)
     return gathered_flat.reshape((total_rows,) + tuple(local_tensor.shape[1:]))
 
 
