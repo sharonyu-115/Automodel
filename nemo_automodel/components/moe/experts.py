@@ -70,9 +70,10 @@ def _reduce_scatter_rank_major(tensor: torch.Tensor, group: dist.ProcessGroup, w
         dist.reduce_scatter_tensor(output_chunk, input_chunk, op=dist.ReduceOp.SUM, group=group)
         local_flat[:, start:end].copy_(output_chunk)
     if tensor.is_cuda:
-        # NCCL calls enqueue asynchronously. Bound their watchdog age and retain
-        # chunk storage until every output copy for this layer has completed.
-        torch.cuda.current_stream(tensor.device).synchronize()
+        # ProcessGroupNCCL runs collectives on a dedicated stream, so syncing
+        # only the current compute stream does not bound its queue depth. Drain
+        # every stream on this device before the next expert layer is enqueued.
+        torch.cuda.synchronize(tensor.device)
     return local_flat.reshape((local_rows,) + tuple(tensor.shape[1:]))
 
 
@@ -101,7 +102,7 @@ def _all_gather_rank_major(local_tensor: torch.Tensor, group: dist.ProcessGroup,
     if local_tensor.is_cuda:
         # See _reduce_scatter_rank_major: do not let collectives from later
         # layers wait behind this layer for most of the watchdog interval.
-        torch.cuda.current_stream(local_tensor.device).synchronize()
+        torch.cuda.synchronize(local_tensor.device)
     return gathered_flat.reshape((total_rows,) + tuple(local_tensor.shape[1:]))
 
 
