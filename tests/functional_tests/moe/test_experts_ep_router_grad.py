@@ -35,7 +35,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.experts import GroupedExperts, _AllReduceInPlaceFn
+from nemo_automodel.components.moe.experts import GroupedExperts, _ReduceScatterVarlenFn
 
 _N_EXPERTS = 4
 _TOP_K = 2
@@ -142,24 +142,25 @@ def _ep_router_grad_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
-def _in_place_all_reduce_worker(rank: int, world_size: int, port: int) -> None:
+def _reduce_scatter_worker(rank: int, world_size: int, port: int) -> None:
     try:
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = str(port)
         dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
-        leaf = torch.full((3, 4), float(rank + 1), requires_grad=True)
-        tensor = leaf * 1.0
-        input_data_ptr = tensor.data_ptr()
-        reduced = _AllReduceInPlaceFn.apply(tensor, dist.group.WORLD)
+        first_chunk = torch.full((3, 4), float(rank + 1))
+        second_chunk = torch.full((2, 4), float(10 * (rank + 1)))
+        leaf = torch.cat([first_chunk, second_chunk]).requires_grad_(True)
+        reduced = _ReduceScatterVarlenFn.apply(leaf * 1.0, dist.group.WORLD, [3, 2], 3)
 
-        assert reduced.data_ptr() == input_data_ptr
-        torch.testing.assert_close(reduced, torch.full_like(reduced, 3.0))
+        expected_value = 3.0 if rank == 0 else 30.0
+        torch.testing.assert_close(reduced, torch.full_like(reduced, expected_value))
 
         rank_loss_scale = float(rank + 1)
         (reduced * rank_loss_scale).sum().backward()
         assert leaf.grad is not None
-        torch.testing.assert_close(leaf.grad, torch.full_like(leaf, 3.0))
+        expected_grad = torch.cat([torch.ones((3, 4)), torch.full((2, 4), 2.0)])
+        torch.testing.assert_close(leaf.grad, expected_grad)
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -173,9 +174,9 @@ def test_ep_all_gather_propagates_router_weight_gradients():
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
-def test_ep_all_reduce_preserves_storage_and_gradients():
+def test_ep_reduce_scatter_handles_uneven_tokens_and_gradients():
     mp.spawn(
-        _in_place_all_reduce_worker,
+        _reduce_scatter_worker,
         args=(len(_TOKENS_PER_RANK), _free_port()),
         nprocs=len(_TOKENS_PER_RANK),
         join=True,

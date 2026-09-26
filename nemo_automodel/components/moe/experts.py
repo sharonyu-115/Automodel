@@ -44,12 +44,23 @@ from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 class _AllGatherConcatVarlenFn(Function):
     """All-gather with variable local lengths and autograd-safe backward.
 
-    Backward uses all-reduce + local narrow instead of reduce-scatter to avoid
-    monitoredBarrier deadlocks observed with mixed FSDP/EP backward collective ordering.
+    Backward uses the matching padded reduce-scatter so each rank receives only
+    the gradient for its original local token slice.
     """
 
     @staticmethod
     def forward(ctx, local_tensor: torch.Tensor, group: dist.ProcessGroup, gathered_lens: list[int], max_len: int):
+        """Gather variable-length local token tensors in rank order.
+
+        Args:
+            local_tensor: Tensor of shape [local_tokens, ...], with arbitrary trailing dimensions.
+            group: Expert-parallel process group across which tokens are gathered.
+            gathered_lens: Number of unpadded tokens contributed by each rank.
+            max_len: Maximum value in ``gathered_lens``.
+
+        Returns:
+            Tensor of shape [global_tokens, ...], ordered as the concatenation of rank-local token slices.
+        """
         local_len = local_tensor.size(0)
         if local_len < max_len:
             pad_shape = (max_len - local_len,) + tuple(local_tensor.shape[1:])
@@ -66,58 +77,116 @@ class _AllGatherConcatVarlenFn(Function):
         ctx.group = group
         ctx.gathered_lens = gathered_lens
         ctx.rank = dist.get_rank(group)
+        ctx.max_len = max_len
         return torch.cat(gathered, dim=0)
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        grad_full = grad_output.contiguous()
-        start = sum(ctx.gathered_lens[: ctx.rank])
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
+        """Reduce and scatter gradients to their originating token ranks.
+
+        Args:
+            grad_output: Tensor of shape [global_tokens, ...], with arbitrary trailing dimensions.
+
+        Returns:
+            Gradient tensor of shape [local_tokens, ...], followed by no gradients for the process group and
+            token-length metadata.
+        """
         local_len = ctx.gathered_lens[ctx.rank]
-        dist.all_reduce(grad_full, op=dist.ReduceOp.SUM, group=ctx.group)
-        grad_local = grad_full.narrow(0, start, local_len).contiguous()
+        if all(length == ctx.max_len for length in ctx.gathered_lens):
+            scatter_input = grad_output.contiguous()
+        else:
+            chunks = grad_output.split(ctx.gathered_lens, dim=0)
+            padded_chunks = []
+            for chunk, length in zip(chunks, ctx.gathered_lens):
+                if length < ctx.max_len:
+                    pad_shape = (ctx.max_len - length,) + tuple(chunk.shape[1:])
+                    chunk = torch.cat([chunk, torch.zeros(pad_shape, dtype=chunk.dtype, device=chunk.device)], dim=0)
+                padded_chunks.append(chunk)
+            scatter_input = torch.cat(padded_chunks, dim=0)
+
+        grad_padded = torch.empty(
+            (ctx.max_len,) + tuple(grad_output.shape[1:]), dtype=grad_output.dtype, device=grad_output.device
+        )
+        dist.reduce_scatter_tensor(grad_padded, scatter_input, op=dist.ReduceOp.SUM, group=ctx.group)
+        grad_local = grad_padded.narrow(0, 0, local_len).contiguous()
         return grad_local, None, None, None
 
 
-class _AllReduceInPlaceFn(Function):
-    """Differentiable in-place sum all-reduce for large expert outputs.
-
-    The output aliases and mutates the input. This avoids the full-tensor clone
-    performed by ``torch.distributed.nn.functional.all_reduce``.
-    """
+class _ReduceScatterVarlenFn(Function):
+    """Differentiable reduce-scatter for variable per-rank token counts."""
 
     @staticmethod
-    def forward(ctx, tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
-        """Sum an expert output over its expert-parallel group in place.
+    def forward(
+        ctx, tensor: torch.Tensor, group: dist.ProcessGroup, gathered_lens: list[int], max_len: int
+    ) -> torch.Tensor:
+        """Sum expert outputs and scatter each rank's original token slice.
 
         Args:
-            tensor: Contiguous tensor of shape [global_tokens, hidden] or
-                [global_tokens, top_k, hidden]. This tensor is mutated in place.
+            tensor: Contiguous tensor of shape [global_tokens, hidden] or [global_tokens, top_k, hidden], ordered
+                as the concatenation of rank-local token slices.
             group: Expert-parallel process group whose ranks own disjoint experts.
+            gathered_lens: Number of unpadded tokens contributed by each rank.
+            max_len: Maximum value in ``gathered_lens``.
 
         Returns:
-            Tensor with the same shape, dtype, device, and storage as ``tensor``,
-            containing the sum across ``group``.
+            Tensor of shape [local_tokens, hidden] or [local_tokens, top_k, hidden] containing the sum across
+            ``group`` for this rank's original token slice.
         """
         ctx.group = group
-        ctx.mark_dirty(tensor)
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
-        return tensor
+        ctx.gathered_lens = gathered_lens
+        ctx.rank = dist.get_rank(group)
+        ctx.max_len = max_len
+
+        if all(length == max_len for length in gathered_lens):
+            scatter_input = tensor.contiguous()
+        else:
+            chunks = tensor.split(gathered_lens, dim=0)
+            padded_chunks = []
+            for chunk, length in zip(chunks, gathered_lens):
+                if length < max_len:
+                    pad_shape = (max_len - length,) + tuple(chunk.shape[1:])
+                    chunk = torch.cat([chunk, torch.zeros(pad_shape, dtype=chunk.dtype, device=chunk.device)], dim=0)
+                padded_chunks.append(chunk)
+            scatter_input = torch.cat(padded_chunks, dim=0)
+
+        local_padded = torch.empty((max_len,) + tuple(tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device)
+        dist.reduce_scatter_tensor(local_padded, scatter_input, op=dist.ReduceOp.SUM, group=group)
+        return local_padded.narrow(0, 0, gathered_lens[ctx.rank]).contiguous()
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
-        """Sum output gradients across the expert-parallel group.
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
+        """Gather local output gradients back into global-token order.
 
         Args:
-            grad_output: Tensor with the same shape as the forward output. It is
-                made contiguous when needed and then mutated in place.
+            grad_output: Tensor of shape [local_tokens, hidden] or [local_tokens, top_k, hidden].
 
         Returns:
-            Gradient tensor with the same shape as ``grad_output`` and no gradient
-            for the process-group argument.
+            Gradient tensor of shape [global_tokens, hidden] or [global_tokens, top_k, hidden], followed by no
+            gradients for the process group and token-length metadata.
         """
-        grad_input = grad_output.contiguous()
-        dist.all_reduce(grad_input, op=dist.ReduceOp.SUM, group=ctx.group)
-        return grad_input, None
+        local_len = ctx.gathered_lens[ctx.rank]
+        if local_len < ctx.max_len:
+            pad_shape = (ctx.max_len - local_len,) + tuple(grad_output.shape[1:])
+            grad_padded = torch.cat(
+                [grad_output, torch.zeros(pad_shape, dtype=grad_output.dtype, device=grad_output.device)], dim=0
+            )
+        else:
+            grad_padded = grad_output.contiguous()
+
+        gathered = torch.empty(
+            (len(ctx.gathered_lens) * ctx.max_len,) + tuple(grad_output.shape[1:]),
+            dtype=grad_output.dtype,
+            device=grad_output.device,
+        )
+        dist.all_gather_into_tensor(gathered, grad_padded, group=ctx.group)
+        if all(length == ctx.max_len for length in ctx.gathered_lens):
+            grad_input = gathered
+        else:
+            padded_chunks = gathered.split(ctx.max_len, dim=0)
+            grad_input = torch.cat(
+                [chunk.narrow(0, 0, length) for chunk, length in zip(padded_chunks, ctx.gathered_lens)], dim=0
+            )
+        return grad_input, None, None, None
 
 
 if TYPE_CHECKING:
@@ -446,10 +515,8 @@ class GroupedExperts(nn.Module):
             # Keep the differentiable all-gather path attached to x without materializing a full-size zero tensor.
             y.add_(x.sum(dtype=torch.float32) * 0.0)
 
-            # Reduce and narrow to the original per-rank token boundaries.
-            y = _AllReduceInPlaceFn.apply(y, ep_group)
-            start = sum(gathered_lens[:ep_rank])
-            y = y.narrow(0, start, local_num_tokens).contiguous()
+            # Sum partial expert outputs and return only this rank's original tokens.
+            y = _ReduceScatterVarlenFn.apply(y, ep_group, gathered_lens, max_len)
 
         if self.config.apply_router_weight_after_down:
             y = y.sum(dim=1)
