@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import time
 from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -49,10 +48,14 @@ _MAX_EP_COLLECTIVE_NUMEL = 1 << 24
 
 def _wait_for_collective(work: dist.Work, device: torch.device) -> None:
     """Wait for one collective without synchronizing unrelated CUDA streams."""
-    if device.type == "cuda":
-        while not work.is_completed():
-            time.sleep(0.001)
     work.wait()
+    if device.type == "cuda":
+        # ProcessGroupNCCL's wait inserts a dependency on the caller stream but
+        # does not block the CPU. Synchronize that stream here so the next EP
+        # chunk cannot be enqueued until this one has actually completed. Do
+        # not synchronize the whole device: unrelated DP/FSDP communicators
+        # may have work in flight on other streams.
+        torch.cuda.current_stream(device).synchronize()
 
 
 def _reduce_scatter_rank_major(tensor: torch.Tensor, group: dist.ProcessGroup, world_size: int) -> torch.Tensor:
