@@ -40,7 +40,10 @@ from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 
 # ── EP variable-length collective helpers ──
 
-_MAX_EP_COLLECTIVE_NUMEL = 1 << 27
+# Keep each BF16 EP collective at or below 32 MiB. Larger collectives can
+# indefinitely stall on multi-node GB200 process groups even when NCCL's input
+# count is below its integer limit.
+_MAX_EP_COLLECTIVE_NUMEL = 1 << 24
 
 
 def _reduce_scatter_rank_major(tensor: torch.Tensor, group: dist.ProcessGroup, world_size: int) -> torch.Tensor:
@@ -69,11 +72,11 @@ def _reduce_scatter_rank_major(tensor: torch.Tensor, group: dist.ProcessGroup, w
         output_chunk = torch.empty((local_rows, end - start), dtype=tensor.dtype, device=tensor.device)
         dist.reduce_scatter_tensor(output_chunk, input_chunk, op=dist.ReduceOp.SUM, group=group)
         local_flat[:, start:end].copy_(output_chunk)
-    if tensor.is_cuda:
-        # ProcessGroupNCCL runs collectives on a dedicated stream, so syncing
-        # only the current compute stream does not bound its queue depth. Drain
-        # every stream on this device before the next expert layer is enqueued.
-        torch.cuda.synchronize(tensor.device)
+        if tensor.is_cuda:
+            # ProcessGroupNCCL runs collectives on a dedicated stream. Drain it
+            # after every chunk so a stalled operation cannot accumulate a
+            # layer's remaining chunks behind it for most of the watchdog age.
+            torch.cuda.synchronize(tensor.device)
     return local_flat.reshape((local_rows,) + tuple(tensor.shape[1:]))
 
 
@@ -99,10 +102,10 @@ def _all_gather_rank_major(local_tensor: torch.Tensor, group: dist.ProcessGroup,
         output_chunk = torch.empty((total_rows, end - start), dtype=local_tensor.dtype, device=local_tensor.device)
         dist.all_gather_into_tensor(output_chunk, input_chunk, group=group)
         gathered_flat[:, start:end].copy_(output_chunk)
-    if local_tensor.is_cuda:
-        # See _reduce_scatter_rank_major: do not let collectives from later
-        # layers wait behind this layer for most of the watchdog interval.
-        torch.cuda.synchronize(local_tensor.device)
+        if local_tensor.is_cuda:
+            # See _reduce_scatter_rank_major: bound both the collective size
+            # and queue depth in the inverse autograd operation as well.
+            torch.cuda.synchronize(local_tensor.device)
     return gathered_flat.reshape((total_rows,) + tuple(local_tensor.shape[1:]))
 
 
