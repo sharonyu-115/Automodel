@@ -35,7 +35,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.experts import GroupedExperts
+from nemo_automodel.components.moe.experts import GroupedExperts, _AllReduceInPlaceFn
 
 _N_EXPERTS = 4
 _TOP_K = 2
@@ -142,8 +142,41 @@ def _ep_router_grad_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
+def _in_place_all_reduce_worker(rank: int, world_size: int, port: int) -> None:
+    try:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = str(port)
+        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+        leaf = torch.full((3, 4), float(rank + 1), requires_grad=True)
+        tensor = leaf * 1.0
+        input_data_ptr = tensor.data_ptr()
+        reduced = _AllReduceInPlaceFn.apply(tensor, dist.group.WORLD)
+
+        assert reduced.data_ptr() == input_data_ptr
+        torch.testing.assert_close(reduced, torch.full_like(reduced, 3.0))
+
+        rank_loss_scale = float(rank + 1)
+        (reduced * rank_loss_scale).sum().backward()
+        assert leaf.grad is not None
+        torch.testing.assert_close(leaf.grad, torch.full_like(leaf, 3.0))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
 def test_ep_all_gather_propagates_router_weight_gradients():
     mp.spawn(
         _ep_router_grad_worker, args=(len(_TOKENS_PER_RANK), _free_port()), nprocs=len(_TOKENS_PER_RANK), join=True
+    )
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
+def test_ep_all_reduce_preserves_storage_and_gradients():
+    mp.spawn(
+        _in_place_all_reduce_worker,
+        args=(len(_TOKENS_PER_RANK), _free_port()),
+        nprocs=len(_TOKENS_PER_RANK),
+        join=True,
     )

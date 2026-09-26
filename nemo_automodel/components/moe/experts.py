@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import torch.distributed as dist
-import torch.distributed.nn.functional as dist_nn_f
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
@@ -77,6 +76,48 @@ class _AllGatherConcatVarlenFn(Function):
         dist.all_reduce(grad_full, op=dist.ReduceOp.SUM, group=ctx.group)
         grad_local = grad_full.narrow(0, start, local_len).contiguous()
         return grad_local, None, None, None
+
+
+class _AllReduceInPlaceFn(Function):
+    """Differentiable in-place sum all-reduce for large expert outputs.
+
+    The output aliases and mutates the input. This avoids the full-tensor clone
+    performed by ``torch.distributed.nn.functional.all_reduce``.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+        """Sum an expert output over its expert-parallel group in place.
+
+        Args:
+            tensor: Contiguous tensor of shape [global_tokens, hidden] or
+                [global_tokens, top_k, hidden]. This tensor is mutated in place.
+            group: Expert-parallel process group whose ranks own disjoint experts.
+
+        Returns:
+            Tensor with the same shape, dtype, device, and storage as ``tensor``,
+            containing the sum across ``group``.
+        """
+        ctx.group = group
+        ctx.mark_dirty(tensor)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """Sum output gradients across the expert-parallel group.
+
+        Args:
+            grad_output: Tensor with the same shape as the forward output. It is
+                made contiguous when needed and then mutated in place.
+
+        Returns:
+            Gradient tensor with the same shape as ``grad_output`` and no gradient
+            for the process-group argument.
+        """
+        grad_input = grad_output.contiguous()
+        dist.all_reduce(grad_input, op=dist.ReduceOp.SUM, group=ctx.group)
+        return grad_input, None
 
 
 if TYPE_CHECKING:
@@ -406,7 +447,7 @@ class GroupedExperts(nn.Module):
             y.add_(x.sum(dtype=torch.float32) * 0.0)
 
             # Reduce and narrow to the original per-rank token boundaries.
-            y = dist_nn_f.all_reduce(y, op=dist.ReduceOp.SUM, group=ep_group)
+            y = _AllReduceInPlaceFn.apply(y, ep_group)
             start = sum(gathered_lens[:ep_rank])
             y = y.narrow(0, start, local_num_tokens).contiguous()
 
