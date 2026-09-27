@@ -866,6 +866,36 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     assert model_call is not None and model_call[1]["mesh"] is fsdp_mesh
 
 
+def test_apply_fsdp_wraps_size_one_expert_mesh_for_cpu_offload(monkeypatch):
+    """EP-owned experts need offload hooks even when their shard mesh is size 1."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    block = DummyBlock(mlp=DummyMoE())
+    model = DummyModel([block])
+    ep_shard_mesh = type("Mesh", (), {"size": lambda self: 1})()
+    offload_policy = object()
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=object(),
+        ep_enabled=True,
+        ep_shard_enabled=False,
+        ep_shard_mesh=ep_shard_mesh,
+        offload_policy=offload_policy,
+    )
+
+    experts_call = _find_call_by_first_arg(fully_shard_mock, block.mlp.experts)
+    assert experts_call is not None
+    _, experts_kwargs = experts_call
+    assert experts_kwargs["mesh"] is ep_shard_mesh
+    assert experts_kwargs["offload_policy"] is offload_policy
+
+
 def test_apply_fsdp_installs_accumulated_grad_guard(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)

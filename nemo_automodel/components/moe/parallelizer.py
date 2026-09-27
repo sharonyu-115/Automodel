@@ -718,7 +718,14 @@ def apply_fsdp(
                 placements=[Replicate()] * fsdp_mesh.ndim,
             )
         experts_reshard_after_forward = False if id(block) in mtp_block_ids else reshard_after_forward
-        if isinstance(moe_module, MoE) and ep_shard_enabled:
+        # Even when the EP-shard mesh has size 1, routed experts still need
+        # their own FSDP unit under CPU offload. They are EP-owned and excluded
+        # from the enclosing block's FSDP unit below, so without this wrapper
+        # ``model.to("cpu")`` leaves them stranded on CPU during CUDA forwards.
+        # A size-1 FSDP unit performs no sharding communication, but supplies
+        # the per-forward onload and post-backward offload lifecycle.
+        wrap_experts_for_cpu_offload = offload_policy is not None and ep_shard_mesh is not None
+        if isinstance(moe_module, MoE) and (ep_shard_enabled or wrap_experts_for_cpu_offload):
             # Apply FSDP on dim=1 for grouped experts since we may have more
             # shards than experts (dim=0).
             # Preserve the enclosing policy's parameter, reduction, and input-cast
