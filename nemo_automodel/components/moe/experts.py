@@ -50,11 +50,11 @@ _MAX_EP_COLLECTIVE_NUMEL = 1 << 22
 # activation-checkpoint recompute.
 _MAX_SCATTER_NUMEL = 1 << 26
 
-# Bound each grouped GEMM to 128 MiB of BF16 input/output at
+# Bound each grouped GEMM to 512 MiB of BF16 input/output at
 # Inkling's 4096-wide routed projections. Router correction biases can send a
 # majority of a long EP batch to one expert, so a token-count microbatch limit
 # is required in addition to feature-chunked activation and collectives.
-_MAX_GROUPED_MM_ROWS = 1 << 14
+_MAX_GROUPED_MM_ROWS = 1 << 16
 
 
 def _scatter_add_in_chunks(
