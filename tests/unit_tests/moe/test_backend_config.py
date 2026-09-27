@@ -95,10 +95,15 @@ class TestBackendConfigExpertsDispatcherValidation:
         assert config.experts == "torch_mm"
         assert config.dispatcher == "torch"
 
-    def test_replicated_input_requires_torch_dispatcher(self):
-        """The replicated-input optimization is specific to the torch dispatcher."""
+    def test_all_to_all_requires_torch_dispatcher(self):
+        """The sparse all-to-all optimization is specific to the torch dispatcher."""
         with pytest.raises(ValueError, match="requires dispatcher='torch'"):
-            BackendConfig(dispatcher="deepep", torch_dispatcher_replicated_input=True)
+            BackendConfig(dispatcher="deepep", torch_dispatcher_all_to_all=True)
+
+    def test_all_to_all_requires_torch_mm_experts(self):
+        """The sparse all-to-all implementation uses the torch grouped-MM path."""
+        with pytest.raises(ValueError, match="requires experts='torch_mm'"):
+            BackendConfig(dispatcher="torch", experts="torch", torch_dispatcher_all_to_all=True)
 
     def test_torch_mm_experts_with_deepep_dispatcher_valid(self):
         """Test that torch_mm experts with deepep dispatcher is valid."""

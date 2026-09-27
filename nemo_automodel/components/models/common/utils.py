@@ -212,10 +212,10 @@ class BackendConfig:
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP for token dispatch,
             "uccl_ep" uses UCCL-EP for token dispatch across heterogeneous GPUs and NICs.
-        torch_dispatcher_replicated_input: Whether the torch dispatcher receives the
-            same tokens on every EP rank. This replaces its all-gather/reduce-scatter
-            with local expert filtering and an output all-reduce. Only enable this
-            for pure expert parallelism with no data-parallel token sharding.
+        torch_dispatcher_all_to_all: Route only selected token/expert assignments to
+            their owning EP ranks with all-to-all instead of materializing the full
+            rank-concatenated activation on every rank. This is intended for large
+            pure-EP jobs whose rank-local policy batches are distinct.
         dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
             manager instance across MoE layers.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should return asynchronously
@@ -257,7 +257,7 @@ class BackendConfig:
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
-    torch_dispatcher_replicated_input: bool = False
+    torch_dispatcher_all_to_all: bool = False
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):
@@ -305,8 +305,10 @@ class BackendConfig:
         if isinstance(self.gate_precision, str):
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)
 
-        if self.torch_dispatcher_replicated_input and self.dispatcher != "torch":
-            raise ValueError("torch_dispatcher_replicated_input requires dispatcher='torch'")
+        if self.torch_dispatcher_all_to_all and self.dispatcher != "torch":
+            raise ValueError("torch_dispatcher_all_to_all requires dispatcher='torch'")
+        if self.torch_dispatcher_all_to_all and self.experts not in ("torch_mm", "torch_mm_mxfp8"):
+            raise ValueError("torch_dispatcher_all_to_all requires experts='torch_mm' or 'torch_mm_mxfp8'")
 
         # enable_deepep was removed. It is no longer honored; warn (once, on rank 0) if a stale
         # config still sets it so the user migrates to explicit dispatcher/experts. The field is

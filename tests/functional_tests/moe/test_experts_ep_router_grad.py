@@ -94,15 +94,15 @@ def _global_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Te
     return x, weights, indices, token_mask
 
 
-def _build_experts(config: MoEConfig, *, torch_mm: bool = False, replicated_input: bool = False) -> GroupedExperts:
+def _build_experts(config: MoEConfig, *, torch_mm: bool = False, all_to_all: bool = False) -> GroupedExperts:
     generator = torch.Generator().manual_seed(4321)
     backend = (
         BackendConfig(
             experts="torch_mm",
             dispatcher="torch",
-            torch_dispatcher_replicated_input=replicated_input,
+            torch_dispatcher_all_to_all=all_to_all,
         )
-        if torch_mm or replicated_input
+        if torch_mm or all_to_all
         else None
     )
     experts = GroupedExperts(config, backend=backend)
@@ -336,22 +336,30 @@ def _chunked_extreme_skew_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
-def _replicated_input_worker(rank: int, world_size: int, port: int) -> None:
+def _all_to_all_worker(rank: int, world_size: int, port: int) -> None:
     try:
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = str(port)
         dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
-        x, weights, _, token_mask = _global_inputs()
-        indices = torch.tensor([[0, 1]]).expand(x.shape[0], -1).clone()
+        x, weights, indices, token_mask = _global_inputs()
+        start = sum(_TOKENS_PER_RANK[:rank])
+        end = start + _TOKENS_PER_RANK[rank]
+        x = x[start:end]
+        weights = weights[start:end]
+        indices = indices[start:end]
+        token_mask = token_mask[start:end]
         reference = _build_experts(_tiny_moe_config())
         reference_x = x.clone().requires_grad_(True)
         reference_weights = weights.clone().requires_grad_(True)
         expected = reference(reference_x, token_mask, reference_weights, indices)
         expected.square().sum().backward()
+        for reference_param in (reference.gate_and_up_projs, reference.down_projs):
+            assert reference_param.grad is not None
+            dist.all_reduce(reference_param.grad)
 
         ep_mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("ep",))
-        distributed = _build_experts(_tiny_moe_config(), torch_mm=True, replicated_input=True)
+        distributed = _build_experts(_tiny_moe_config(), torch_mm=True, all_to_all=True)
         distributed.gate_and_up_projs = nn.Parameter(
             distribute_tensor(distributed.gate_and_up_projs.detach(), ep_mesh, [Shard(0)])
         )
@@ -424,9 +432,9 @@ def test_ep_chunked_experts_handle_extreme_routing_skew():
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
-def test_ep_replicated_input_avoids_global_activation_gather():
+def test_ep_all_to_all_handles_distinct_rank_local_inputs_and_gradients():
     mp.spawn(
-        _replicated_input_worker,
+        _all_to_all_worker,
         args=(len(_TOKENS_PER_RANK), _free_port()),
         nprocs=len(_TOKENS_PER_RANK),
         join=True,

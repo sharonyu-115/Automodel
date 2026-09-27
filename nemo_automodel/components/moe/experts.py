@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
@@ -217,35 +218,6 @@ class _AllGatherConcatVarlenFn(Function):
         grad_padded = _reduce_scatter_rank_major(scatter_input, ctx.group, len(ctx.gathered_lens))
         grad_local = grad_padded.narrow(0, 0, local_len).contiguous()
         return grad_local, None, None, None
-
-
-class _ReplicatedInputFn(Function):
-    """Keep a replicated EP input local and sum its partial expert gradients."""
-
-    @staticmethod
-    def forward(ctx, tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
-        ctx.group = group
-        return tensor
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
-        grad_input = grad_output.contiguous()
-        dist.all_reduce(grad_input, op=dist.ReduceOp.SUM, group=ctx.group)
-        return grad_input, None
-
-
-class _AllReduceSumFn(Function):
-    """Sum local expert outputs while preserving rank-local expert gradients."""
-
-    @staticmethod
-    def forward(ctx, tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
-        output = tensor.clone()
-        dist.all_reduce(output, op=dist.ReduceOp.SUM, group=group)
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
-        return grad_output, None
 
 
 class _ReduceScatterVarlenFn(Function):
@@ -560,7 +532,7 @@ class GroupedExperts(nn.Module):
         # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
         self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
         self.use_mxfp8 = backend is not None and backend.experts == "torch_mm_mxfp8"
-        self.replicated_input = backend is not None and backend.torch_dispatcher_replicated_input
+        self.use_all_to_all = backend is not None and backend.torch_dispatcher_all_to_all
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -656,18 +628,28 @@ class GroupedExperts(nn.Module):
             else None
         )
 
-        # EP variable-length all-gather
-        replicated_ep = ep_size > 1 and self.replicated_input
-        if replicated_ep:
+        if ep_size > 1 and self.use_all_to_all:
             if ep_size != dist.get_world_size():
                 raise RuntimeError(
-                    "torch_dispatcher_replicated_input requires a pure EP process group "
+                    "torch_dispatcher_all_to_all requires a pure EP process group "
                     f"({ep_size=} != global world size {dist.get_world_size()})"
                 )
-            ep_group = ep_mesh.get_group()
-            x = _ReplicatedInputFn.apply(x, ep_group)
-            weights = _ReplicatedInputFn.apply(weights, ep_group)
-        elif ep_size > 1:
+            return self._forward_all_to_all(
+                x,
+                token_mask,
+                weights,
+                indices,
+                gate_and_up_projs,
+                down_projs,
+                gate_up_proj_bias,
+                down_proj_bias,
+                ep_mesh,
+                ep_rank,
+                ep_size,
+            ).to(input_dtype)
+
+        # EP variable-length all-gather
+        if ep_size > 1:
             ep_group = ep_mesh.get_group()
             local_num_tokens = x.size(0)
 
@@ -718,10 +700,9 @@ class GroupedExperts(nn.Module):
                 down_proj_bias,
                 n_local_experts,
                 experts_start_idx,
-                ep_group if ep_size > 1 and not replicated_ep else None,
-                gathered_lens if ep_size > 1 and not replicated_ep else None,
-                max_len if ep_size > 1 and not replicated_ep else None,
-                force_matmul_backward=replicated_ep,
+                ep_group if ep_size > 1 else None,
+                gathered_lens if ep_size > 1 else None,
+                max_len if ep_size > 1 else None,
             )
         else:
             already_reduce_scattered = False
@@ -739,9 +720,7 @@ class GroupedExperts(nn.Module):
                 experts_end_idx,
             )
 
-        if replicated_ep:
-            y = _AllReduceSumFn.apply(y, ep_group)
-        elif ep_size > 1:
+        if ep_size > 1:
             # Sum partial expert outputs and return only this rank's original tokens.
             if not already_reduce_scattered:
                 # Keep the differentiable activation gather attached on the
@@ -752,6 +731,112 @@ class GroupedExperts(nn.Module):
         if self.config.apply_router_weight_after_down:
             y = y.sum(dim=1)
         return y.to(input_dtype)
+
+    def _forward_all_to_all(
+        self,
+        x: torch.Tensor,
+        token_mask: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        gate_and_up_projs: torch.Tensor,
+        down_projs: torch.Tensor,
+        gate_up_proj_bias: torch.Tensor | None,
+        down_proj_bias: torch.Tensor | None,
+        ep_mesh: DeviceMesh,
+        ep_rank: int,
+        ep_size: int,
+    ) -> torch.Tensor:
+        """Dispatch sparse token/expert assignments and return rank-local outputs.
+
+        Policy workers hold distinct rank-local batches even when the process mesh
+        is pure expert parallelism. Sending each valid top-k assignment directly
+        to its expert owner avoids the full ``EP * local_tokens`` activation that
+        the all-gather dispatcher materializes while retaining exact gradients for
+        activations, router probabilities, and local expert parameters.
+        """
+        ep_group = ep_mesh.get_group()
+        n_local_experts = self.n_routed_experts // ep_size
+
+        valid_slots = token_mask.unsqueeze(-1).expand_as(indices).reshape(-1)
+        flat_indices = indices.reshape(-1)
+        flat_weights = weights.reshape(-1)
+        flat_token_ids = torch.arange(x.shape[0], device=x.device).unsqueeze(1).expand(-1, indices.shape[1]).reshape(-1)
+        valid_indices = flat_indices[valid_slots]
+        valid_weights = flat_weights[valid_slots]
+        valid_token_ids = flat_token_ids[valid_slots]
+        owners = torch.div(valid_indices, n_local_experts, rounding_mode="floor")
+        send_order = owners.argsort(stable=True)
+        send_owners = owners[send_order]
+        send_indices = valid_indices[send_order].contiguous()
+        send_weights = valid_weights[send_order].contiguous()
+        send_token_ids = valid_token_ids[send_order]
+        send_x = x.index_select(0, send_token_ids).contiguous()
+
+        send_counts_tensor = torch.bincount(send_owners, minlength=ep_size).to(torch.int64)
+        recv_counts_tensor = torch.empty_like(send_counts_tensor)
+        dist.all_to_all_single(recv_counts_tensor, send_counts_tensor, group=ep_group)
+        send_counts = send_counts_tensor.tolist()
+        recv_counts = recv_counts_tensor.tolist()
+        recv_rows = sum(recv_counts)
+
+        recv_x = x.new_empty((recv_rows, x.shape[1]))
+        recv_weights = weights.new_empty((recv_rows,))
+        recv_indices = indices.new_empty((recv_rows,))
+        recv_x = dist_nn.all_to_all_single(
+            recv_x,
+            send_x,
+            output_split_sizes=recv_counts,
+            input_split_sizes=send_counts,
+            group=ep_group,
+        )
+        recv_weights = dist_nn.all_to_all_single(
+            recv_weights,
+            send_weights,
+            output_split_sizes=recv_counts,
+            input_split_sizes=send_counts,
+            group=ep_group,
+        )
+        dist.all_to_all_single(
+            recv_indices,
+            send_indices,
+            output_split_sizes=recv_counts,
+            input_split_sizes=send_counts,
+            group=ep_group,
+        )
+
+        recv_weights_2d = recv_weights.unsqueeze(-1)
+        recv_indices_2d = recv_indices.unsqueeze(-1)
+        recv_mask = torch.ones(recv_rows, dtype=torch.bool, device=x.device)
+        owner_output, _ = self._forward_grouped_mm(
+            recv_x,
+            recv_mask,
+            recv_weights_2d,
+            recv_indices_2d,
+            gate_and_up_projs,
+            down_projs,
+            gate_up_proj_bias,
+            down_proj_bias,
+            n_local_experts,
+            ep_rank * n_local_experts,
+            None,
+            None,
+            None,
+            force_matmul_backward=True,
+        )
+        if self.config.apply_router_weight_after_down:
+            owner_output = owner_output.sum(dim=1)
+
+        returned = x.new_empty((send_token_ids.numel(), x.shape[1]))
+        returned = dist_nn.all_to_all_single(
+            returned,
+            owner_output.contiguous(),
+            output_split_sizes=send_counts,
+            input_split_sizes=recv_counts,
+            group=ep_group,
+        )
+        output = x.new_zeros(x.shape)
+        output.index_add_(0, send_token_ids, returned)
+        return output
 
     def _forward_loop(
         self,
@@ -973,8 +1058,10 @@ class GroupedExperts(nn.Module):
                     _scatter_add_in_chunks(y, scatter_ids, output2)
         else:
             # Dummy computation for gradient flow
-            output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
-            output1_ = self.expert_activation_grouped(output1, weights[0, 0, None].unsqueeze(0))
+            dummy_x = x.new_zeros((1, gate_and_up_projs.shape[1]))
+            dummy_prob = weights.new_ones((1, 1))
+            output1 = torch.matmul(dummy_x, gate_and_up_projs[0])
+            output1_ = self.expert_activation_grouped(output1, dummy_prob)
             output2 = torch.matmul(output1_, down_projs[0])
             if ep_group is not None:
                 rows_per_token = weights.shape[1] if self.config.apply_router_weight_after_down else 1
@@ -988,10 +1075,8 @@ class GroupedExperts(nn.Module):
                 )
             else:
                 y = torch.zeros(output_shape, dtype=x.dtype, device=x.device)
-                if self.config.apply_router_weight_after_down:
-                    y[0, 0] += output2[0]
-                else:
-                    y[0] += output2[0]
+                dependency = output2.sum() * 0.0 + x.sum() * 0.0 + weights.sum() * 0.0
+                y = y + dependency.to(y.dtype)
 
         return y, ep_group is not None
 
