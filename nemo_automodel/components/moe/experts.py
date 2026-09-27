@@ -45,6 +45,31 @@ from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 # count is below its integer limit.
 _MAX_EP_COLLECTIVE_NUMEL = 1 << 22
 
+# Bound temporary FP32 expert-output casts to 256 MiB. A full cast can exceed
+# 3 GiB for long EP batches and OOM during activation-checkpoint recompute even
+# though the persistent FP32 accumulation buffer fits.
+_MAX_FP32_SCATTER_NUMEL = 1 << 26
+
+
+def _scatter_add_fp32_in_chunks(
+    target: torch.Tensor,
+    index: torch.Tensor,
+    source: torch.Tensor,
+    *,
+    weights: torch.Tensor | None = None,
+) -> None:
+    """Accumulate expert rows in FP32 without materializing a full FP32 source."""
+    if source.ndim != 2 or index.shape != source.shape:
+        raise ValueError(f"Expected matching 2D source/index tensors, got {source.shape=} and {index.shape=}")
+
+    rows_per_chunk = max(1, _MAX_FP32_SCATTER_NUMEL // source.shape[1])
+    for start in range(0, source.shape[0], rows_per_chunk):
+        end = min(start + rows_per_chunk, source.shape[0])
+        source_chunk = source[start:end].float()
+        if weights is not None:
+            source_chunk = source_chunk * weights[start:end].float()
+        target.scatter_add_(0, index[start:end], source_chunk)
+
 
 def _wait_for_collective(work: dist.Work, device: torch.device) -> None:
     """Wait for one collective without synchronizing unrelated CUDA streams."""
@@ -738,12 +763,16 @@ class GroupedExperts(nn.Module):
                 )
 
             if self.config.apply_router_weight_after_down:
-                output2 = output2.float() * permuted_probs.float()
                 scatter_ids = sorted_slot_ids.unsqueeze(1).expand_as(output2)
-                y.view(-1, x.size(1)).scatter_add_(0, scatter_ids, output2.float())
+                _scatter_add_fp32_in_chunks(
+                    y.view(-1, x.size(1)),
+                    scatter_ids,
+                    output2,
+                    weights=permuted_probs,
+                )
             else:
                 scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
-                y.scatter_add_(0, scatter_ids, output2.float())
+                _scatter_add_fp32_in_chunks(y, scatter_ids, output2)
         else:
             # Dummy computation for gradient flow
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])

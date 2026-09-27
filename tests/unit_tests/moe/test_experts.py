@@ -29,11 +29,39 @@ from nemo_automodel.components.moe.experts import (
     GroupedExpertsDeepEP,
     _apply_bias,
     _permute_tokens_for_grouped_mm,
+    _scatter_add_fp32_in_chunks,
     _torch_mm_experts_fwd,
     get_expert_activation_for_deepep,
     is_gated_activation,
     swiglu_clamped_deepep,
 )
+
+
+@pytest.mark.parametrize("weighted", [False, True])
+def test_scatter_add_fp32_in_chunks_matches_full_cast(monkeypatch, weighted):
+    """Chunked accumulation preserves FP32 output and source/weight gradients."""
+    monkeypatch.setattr("nemo_automodel.components.moe.experts._MAX_FP32_SCATTER_NUMEL", 8)
+    source = torch.randn(7, 4, dtype=torch.bfloat16, requires_grad=True)
+    source_ref = source.detach().clone().requires_grad_(True)
+    row_ids = torch.tensor([0, 2, 1, 0, 2, 2, 1])
+    index = row_ids.unsqueeze(1).expand_as(source)
+    weights = torch.randn(7, 1, dtype=torch.bfloat16, requires_grad=True) if weighted else None
+    weights_ref = weights.detach().clone().requires_grad_(True) if weights is not None else None
+
+    actual = torch.zeros(3, 4, dtype=torch.float32)
+    _scatter_add_fp32_in_chunks(actual, index, source, weights=weights)
+    expected = torch.zeros_like(actual)
+    expected_source = source_ref.float()
+    if weights_ref is not None:
+        expected_source = expected_source * weights_ref.float()
+    expected.scatter_add_(0, index, expected_source)
+
+    torch.testing.assert_close(actual, expected)
+    actual.square().sum().backward()
+    expected.square().sum().backward()
+    torch.testing.assert_close(source.grad, source_ref.grad)
+    if weights is not None:
+        torch.testing.assert_close(weights.grad, weights_ref.grad)
 
 
 @pytest.fixture
