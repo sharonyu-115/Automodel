@@ -30,7 +30,7 @@ from nemo_automodel.components.moe.experts import (
     _AllGatherConcatVarlenFn,
     _apply_bias,
     _permute_tokens_for_grouped_mm,
-    _scatter_add_fp32_in_chunks,
+    _scatter_add_in_chunks,
     _torch_mm_experts_fwd,
     get_expert_activation_for_deepep,
     is_gated_activation,
@@ -61,9 +61,10 @@ def test_varlen_all_gather_forward_uses_bounded_rank_major_collective(monkeypatc
 
 
 @pytest.mark.parametrize("weighted", [False, True])
-def test_scatter_add_fp32_in_chunks_matches_full_cast(monkeypatch, weighted):
-    """Chunked accumulation preserves FP32 output and source/weight gradients."""
-    monkeypatch.setattr("nemo_automodel.components.moe.experts._MAX_FP32_SCATTER_NUMEL", 8)
+@pytest.mark.parametrize("accumulation_dtype", [torch.bfloat16, torch.float32])
+def test_scatter_add_in_chunks_matches_full_cast(monkeypatch, weighted, accumulation_dtype):
+    """Chunked accumulation preserves output and source/weight gradients."""
+    monkeypatch.setattr("nemo_automodel.components.moe.experts._MAX_SCATTER_NUMEL", 8)
     source = torch.randn(7, 4, dtype=torch.bfloat16, requires_grad=True)
     source_ref = source.detach().clone().requires_grad_(True)
     row_ids = torch.tensor([0, 2, 1, 0, 2, 2, 1])
@@ -71,12 +72,12 @@ def test_scatter_add_fp32_in_chunks_matches_full_cast(monkeypatch, weighted):
     weights = torch.randn(7, 1, dtype=torch.bfloat16, requires_grad=True) if weighted else None
     weights_ref = weights.detach().clone().requires_grad_(True) if weights is not None else None
 
-    actual = torch.zeros(3, 4, dtype=torch.float32)
-    _scatter_add_fp32_in_chunks(actual, index, source, weights=weights)
+    actual = torch.zeros(3, 4, dtype=accumulation_dtype)
+    _scatter_add_in_chunks(actual, index, source, weights=weights)
     expected = torch.zeros_like(actual)
-    expected_source = source_ref.float()
+    expected_source = source_ref.to(accumulation_dtype)
     if weights_ref is not None:
-        expected_source = expected_source * weights_ref.float()
+        expected_source = expected_source * weights_ref.to(accumulation_dtype)
     expected.scatter_add_(0, index, expected_source)
 
     torch.testing.assert_close(actual, expected)

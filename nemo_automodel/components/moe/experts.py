@@ -45,29 +45,29 @@ from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 # count is below its integer limit.
 _MAX_EP_COLLECTIVE_NUMEL = 1 << 22
 
-# Bound temporary FP32 expert-output casts to 256 MiB. A full cast can exceed
-# 3 GiB for long EP batches and OOM during activation-checkpoint recompute even
-# though the persistent FP32 accumulation buffer fits.
-_MAX_FP32_SCATTER_NUMEL = 1 << 26
+# Bound temporary expert-output casts to 256 MiB even for FP32 accumulation.
+# A full cast can exceed 3 GiB for long EP batches and OOM during
+# activation-checkpoint recompute.
+_MAX_SCATTER_NUMEL = 1 << 26
 
 
-def _scatter_add_fp32_in_chunks(
+def _scatter_add_in_chunks(
     target: torch.Tensor,
     index: torch.Tensor,
     source: torch.Tensor,
     *,
     weights: torch.Tensor | None = None,
 ) -> None:
-    """Accumulate expert rows in FP32 without materializing a full FP32 source."""
+    """Accumulate expert rows without materializing a full cast of the source."""
     if source.ndim != 2 or index.shape != source.shape:
         raise ValueError(f"Expected matching 2D source/index tensors, got {source.shape=} and {index.shape=}")
 
-    rows_per_chunk = max(1, _MAX_FP32_SCATTER_NUMEL // source.shape[1])
+    rows_per_chunk = max(1, _MAX_SCATTER_NUMEL // source.shape[1])
     for start in range(0, source.shape[0], rows_per_chunk):
         end = min(start + rows_per_chunk, source.shape[0])
-        source_chunk = source[start:end].float()
+        source_chunk = source[start:end].to(target.dtype)
         if weights is not None:
-            source_chunk = source_chunk * weights[start:end].float()
+            source_chunk = source_chunk * weights[start:end].to(target.dtype)
         target.scatter_add_(0, index[start:end], source_chunk)
 
 
@@ -628,7 +628,7 @@ class GroupedExperts(nn.Module):
         output_shape = (
             (x.shape[0], weights.shape[1], x.shape[1]) if self.config.apply_router_weight_after_down else x.shape
         )
-        y = torch.zeros(output_shape, dtype=torch.float32, device=x.device)
+        y = torch.zeros(output_shape, dtype=x.dtype, device=x.device)
 
         active_local_experts = 0
         for i in range(experts_start_idx, experts_end_idx):
@@ -668,12 +668,12 @@ class GroupedExperts(nn.Module):
                 )
 
             if self.config.apply_router_weight_after_down:
-                expert_out = expert_out.float() * w.float()
+                expert_out = expert_out * w.to(expert_out.dtype)
                 slot_ids = idx * weights.shape[1] + top
                 slot_ids_b = slot_ids[:, None].expand(-1, x.size(1))
-                y.view(-1, x.size(1)).scatter_add_(dim=0, index=slot_ids_b, src=expert_out.float())
+                y.view(-1, x.size(1)).scatter_add_(dim=0, index=slot_ids_b, src=expert_out.to(y.dtype))
             else:
-                y.scatter_add_(dim=0, index=idx_b, src=expert_out.float())
+                y.scatter_add_(dim=0, index=idx_b, src=expert_out.to(y.dtype))
 
         # Dummy computation for gradient flow when no tokens routed locally
         if active_local_experts == 0:
@@ -720,7 +720,7 @@ class GroupedExperts(nn.Module):
         output_shape = (
             (x.shape[0], weights.shape[1], x.shape[1]) if self.config.apply_router_weight_after_down else x.shape
         )
-        y = torch.zeros(output_shape, dtype=torch.float32, device=x.device)
+        y = torch.zeros(output_shape, dtype=x.dtype, device=x.device)
 
         if sorted_token_ids.numel() > 0:
             permuted_x = x[sorted_token_ids]
@@ -763,7 +763,7 @@ class GroupedExperts(nn.Module):
 
             if self.config.apply_router_weight_after_down:
                 scatter_ids = sorted_slot_ids.unsqueeze(1).expand_as(output2)
-                _scatter_add_fp32_in_chunks(
+                _scatter_add_in_chunks(
                     y.view(-1, x.size(1)),
                     scatter_ids,
                     output2,
@@ -771,7 +771,7 @@ class GroupedExperts(nn.Module):
                 )
             else:
                 scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
-                _scatter_add_fp32_in_chunks(y, scatter_ids, output2)
+                _scatter_add_in_chunks(y, scatter_ids, output2)
         else:
             # Dummy computation for gradient flow
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
