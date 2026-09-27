@@ -32,6 +32,8 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
+_INKLING_SWIGLU_CHUNK_BYTES = 256 * 1024 * 1024
+
 
 def _mask_padding_states(hidden_states: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
     """Zero padded tokens before a short convolution.
@@ -335,7 +337,24 @@ def inkling_swiglu(hidden_states: torch.Tensor, routing_weights: torch.Tensor) -
     """
     gate = hidden_states[..., ::2]
     up = hidden_states[..., 1::2]
-    return (F.silu(gate) * up * routing_weights).to(hidden_states.dtype)
+    compute_dtype = torch.promote_types(gate.dtype, routing_weights.dtype)
+    output_bytes = gate.numel() * compute_dtype.itemsize
+    if gate.ndim != 2 or output_bytes <= _INKLING_SWIGLU_CHUNK_BYTES:
+        return (F.silu(gate) * up * routing_weights).to(hidden_states.dtype)
+
+    # Inkling keeps router weights in fp32. Applying them to the full routed
+    # expert activation therefore creates a multi-GiB fp32 temporary even
+    # though the result is immediately cast back to the model dtype. Bound that
+    # temporary while retaining the same fp32 multiply and output conversion.
+    row_bytes = gate.shape[-1] * compute_dtype.itemsize
+    rows_per_chunk = max(1, _INKLING_SWIGLU_CHUNK_BYTES // row_bytes)
+    output = torch.empty(gate.shape, dtype=hidden_states.dtype, device=hidden_states.device)
+    slice_routing_weights = routing_weights.ndim > 0 and routing_weights.shape[0] == gate.shape[0]
+    for start in range(0, gate.shape[0], rows_per_chunk):
+        end = min(start + rows_per_chunk, gate.shape[0])
+        weights = routing_weights[start:end] if slice_routing_weights else routing_weights
+        output[start:end] = (F.silu(gate[start:end]) * up[start:end] * weights).to(hidden_states.dtype)
+    return output
 
 
 class InklingDenseMLP(nn.Module):

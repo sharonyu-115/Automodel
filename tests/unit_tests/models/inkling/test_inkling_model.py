@@ -26,6 +26,7 @@ from nemo_automodel.components.datasets.vlm.collate_fns import (
 )
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
+from nemo_automodel.components.models.inkling import layers as inkling_layers
 from nemo_automodel.components.models.inkling.configuration import InklingConfig
 from nemo_automodel.components.models.inkling.layers import InklingDenseMLP, InklingMoE
 from nemo_automodel.components.models.inkling.model import InklingForConditionalGeneration
@@ -68,6 +69,27 @@ def test_sparse_layers_use_inkling_moe():
             assert type(layer.mlp).__module__ == "nemo_automodel.components.models.inkling.layers"
         else:
             assert isinstance(layer.mlp, InklingDenseMLP)
+
+
+def test_chunked_inkling_swiglu_matches_unchunked_output_and_gradients(monkeypatch):
+    torch.manual_seed(7)
+    hidden_states = torch.randn(11, 24, dtype=torch.bfloat16, requires_grad=True)
+    routing_weights = torch.randn(11, 1, dtype=torch.float32, requires_grad=True)
+    reference_hidden = hidden_states.detach().clone().requires_grad_()
+    reference_weights = routing_weights.detach().clone().requires_grad_()
+
+    reference_gate = reference_hidden[..., ::2]
+    reference_up = reference_hidden[..., 1::2]
+    reference = (F.silu(reference_gate) * reference_up * reference_weights).to(reference_hidden.dtype)
+    reference.square().sum().backward()
+
+    monkeypatch.setattr(inkling_layers, "_INKLING_SWIGLU_CHUNK_BYTES", 3 * hidden_states.element_size())
+    actual = inkling_layers.inkling_swiglu(hidden_states, routing_weights)
+    actual.square().sum().backward()
+
+    torch.testing.assert_close(actual, reference)
+    torch.testing.assert_close(hidden_states.grad, reference_hidden.grad)
+    torch.testing.assert_close(routing_weights.grad, reference_weights.grad)
 
 
 def test_inkling_small_checkpoint_widths_produce_matching_parameter_shapes():
