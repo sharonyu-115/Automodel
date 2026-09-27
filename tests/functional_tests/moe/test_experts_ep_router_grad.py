@@ -254,7 +254,7 @@ def _scatter_reduce_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
-def _chunked_inference_worker(rank: int, world_size: int, port: int) -> None:
+def _chunked_extreme_skew_worker(rank: int, world_size: int, port: int) -> None:
     try:
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = str(port)
@@ -282,6 +282,37 @@ def _chunked_inference_worker(rank: int, world_size: int, port: int) -> None:
             actual = distributed(x[start:end], token_mask[start:end], weights[start:end], indices[start:end])
 
         torch.testing.assert_close(actual, expected[start:end], rtol=1e-4, atol=1e-5)
+
+        reference.zero_grad(set_to_none=True)
+        distributed.zero_grad(set_to_none=True)
+        reference_weights = weights.clone().requires_grad_(True)
+        expected = reference(x, token_mask, reference_weights, indices)
+        expected.sum().backward()
+        local_weights = weights[start:end].clone().requires_grad_(True)
+        actual = distributed(x[start:end], token_mask[start:end], local_weights, indices[start:end])
+        actual.sum().backward()
+
+        assert reference_weights.grad is not None
+        assert local_weights.grad is not None
+        torch.testing.assert_close(actual, expected[start:end], rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(local_weights.grad, reference_weights.grad[start:end], rtol=1e-4, atol=1e-5)
+
+        experts_per_rank = _N_EXPERTS // world_size
+        expert_start = rank * experts_per_rank
+        expert_end = expert_start + experts_per_rank
+        for actual_param, reference_param in (
+            (distributed.gate_and_up_projs, reference.gate_and_up_projs),
+            (distributed.down_projs, reference.down_projs),
+        ):
+            assert actual_param.grad is not None
+            assert reference_param.grad is not None
+            actual_grad = actual_param.grad.to_local() if isinstance(actual_param.grad, DTensor) else actual_param.grad
+            torch.testing.assert_close(
+                actual_grad,
+                reference_param.grad[expert_start:expert_end],
+                rtol=1e-4,
+                atol=1e-5,
+            )
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -315,9 +346,9 @@ def test_ep_sparse_scatter_reduce_handles_layouts_duplicates_and_gradients():
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
-def test_ep_chunked_inference_handles_extreme_routing_skew():
+def test_ep_chunked_experts_handle_extreme_routing_skew():
     mp.spawn(
-        _chunked_inference_worker,
+        _chunked_extreme_skew_worker,
         args=(len(_TOKENS_PER_RANK), _free_port()),
         nprocs=len(_TOKENS_PER_RANK),
         join=True,

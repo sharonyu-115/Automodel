@@ -1371,6 +1371,23 @@ def _torch_mm_experts_chunked(
             source = output2.to(x.dtype)
             if apply_router_weight_after_down:
                 source = source * sorted_weights[start:local_end, None].to(x.dtype)
+        elif start == 0 and local_rows == 0 and torch.is_grad_enabled():
+            # Keep the local expert parameter tensor in the autograd graph when
+            # router skew sends this rank no rows. FSDP still expects every
+            # expert shard to produce a (possibly all-zero) gradient.
+            dummy_tokens_per_expert = torch.zeros_like(offs)
+            dummy_tokens_per_expert[0] = 1
+            output2 = _torch_mm_experts_fwd(
+                x[:1] * 0.0,
+                gate_and_up_projs,
+                down_projs,
+                dummy_tokens_per_expert,
+                sorted_weights.new_ones((1, 1)),
+                activation_fn,
+                use_mxfp8=use_mxfp8,
+            )
+            source = output2.to(x.dtype) * 0.0
+            destination_rows = sorted_token_ids.new_zeros((1,))
         else:
             source = x.new_empty((0, x.shape[1]))
             destination_rows = sorted_token_ids.new_empty((0,))
