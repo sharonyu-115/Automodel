@@ -33,7 +33,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Shard, distribute_tensor
+from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
 import nemo_automodel.components.moe.experts as experts_module
 from nemo_automodel.components.moe.config import MoEConfig
@@ -114,7 +114,7 @@ def test_equal_length_all_gather_reuses_rank_major_storage(monkeypatch: pytest.M
     assert actual is gathered
 
 
-def _reference_forward_backward() -> tuple[torch.Tensor, torch.Tensor]:
+def _reference_forward_backward() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single-process (ep_size=1) forward/backward as ground truth."""
     experts = _build_experts(_tiny_moe_config())
     x, weights, indices, token_mask = _global_inputs()
@@ -122,7 +122,14 @@ def _reference_forward_backward() -> tuple[torch.Tensor, torch.Tensor]:
     y = experts(x, token_mask, weights, indices)
     y.sum().backward()
     assert weights.grad is not None
-    return y.detach(), weights.grad.detach()
+    assert experts.gate_and_up_projs.grad is not None
+    assert experts.down_projs.grad is not None
+    return (
+        y.detach(),
+        weights.grad.detach(),
+        experts.gate_and_up_projs.grad.detach(),
+        experts.down_projs.grad.detach(),
+    )
 
 
 def _ep_router_grad_worker(rank: int, world_size: int, port: int) -> None:
@@ -133,7 +140,7 @@ def _ep_router_grad_worker(rank: int, world_size: int, port: int) -> None:
         os.environ["WORLD_SIZE"] = str(world_size)
         dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
-        y_ref, weights_grad_ref = _reference_forward_backward()
+        y_ref, weights_grad_ref, gate_up_grad_ref, down_grad_ref = _reference_forward_backward()
 
         ep_mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("ep",))
         experts = _build_experts(_tiny_moe_config())
@@ -141,6 +148,7 @@ def _ep_router_grad_worker(rank: int, world_size: int, port: int) -> None:
             distribute_tensor(experts.gate_and_up_projs.detach(), ep_mesh, [Shard(0)])
         )
         experts.down_projs = nn.Parameter(distribute_tensor(experts.down_projs.detach(), ep_mesh, [Shard(0)]))
+        experts_module._MAX_GROUPED_MM_ROWS = 2
 
         x, weights, indices, token_mask = _global_inputs()
         start = sum(_TOKENS_PER_RANK[:rank])
@@ -156,6 +164,18 @@ def _ep_router_grad_worker(rank: int, world_size: int, port: int) -> None:
         # ``dist.all_gather`` and the local router leaf received no gradient.
         assert local_weights.grad is not None, "router weights received no gradient through the EP all-gather"
         torch.testing.assert_close(local_weights.grad, weights_grad_ref[start:end], rtol=1e-4, atol=1e-5)
+
+        experts_per_rank = _N_EXPERTS // world_size
+        expert_start = rank * experts_per_rank
+        expert_end = expert_start + experts_per_rank
+        for actual_grad, expected_grad in (
+            (experts.gate_and_up_projs.grad, gate_up_grad_ref[expert_start:expert_end]),
+            (experts.down_projs.grad, down_grad_ref[expert_start:expert_end]),
+        ):
+            assert actual_grad is not None
+            if isinstance(actual_grad, DTensor):
+                actual_grad = actual_grad.to_local()
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-4, atol=1e-5)
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

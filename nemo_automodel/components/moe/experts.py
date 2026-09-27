@@ -50,7 +50,7 @@ _MAX_EP_COLLECTIVE_NUMEL = 1 << 22
 # activation-checkpoint recompute.
 _MAX_SCATTER_NUMEL = 1 << 26
 
-# Bound each inference-only grouped GEMM to 128 MiB of BF16 input/output at
+# Bound each grouped GEMM to 128 MiB of BF16 input/output at
 # Inkling's 4096-wide routed projections. Router correction biases can send a
 # majority of a long EP batch to one expert, so a token-count microbatch limit
 # is required in addition to feature-chunked activation and collectives.
@@ -824,8 +824,8 @@ class GroupedExperts(nn.Module):
             (x.shape[0], weights.shape[1], x.shape[1]) if self.config.apply_router_weight_after_down else x.shape
         )
 
-        if ep_group is not None and not self.expert_bias and not torch.is_grad_enabled():
-            y = _torch_mm_experts_chunked_inference(
+        if ep_group is not None and not self.expert_bias:
+            y = _torch_mm_experts_chunked(
                 x,
                 sorted_token_ids,
                 sorted_slot_ids,
@@ -1318,7 +1318,7 @@ def _torch_mm_experts_fwd(
     return output2
 
 
-def _torch_mm_experts_chunked_inference(
+def _torch_mm_experts_chunked(
     x: torch.Tensor,
     sorted_token_ids: torch.Tensor,
     sorted_slot_ids: torch.Tensor,
@@ -1335,7 +1335,7 @@ def _torch_mm_experts_chunked_inference(
     *,
     use_mxfp8: bool,
 ) -> torch.Tensor:
-    """Run skewed EP expert inference without materializing all routed rows."""
+    """Run skewed EP experts without materializing all routed rows."""
     local_rows = sorted_token_ids.numel()
     max_rows_tensor = torch.tensor(local_rows, dtype=torch.int64, device=x.device)
     dist.all_reduce(max_rows_tensor, op=dist.ReduceOp.MAX, group=ep_group)
@@ -1385,6 +1385,8 @@ def _torch_mm_experts_chunked_inference(
         )
         if y is None:
             y = partial_y
+        elif torch.is_grad_enabled():
+            y = y + partial_y
         else:
             y.add_(partial_y)
 
