@@ -168,9 +168,8 @@ class _AllGatherConcatVarlenFn(Function):
             local_padded = local_tensor
 
         world_size = len(gathered_lens)
-        gathered = [torch.empty_like(local_padded) for _ in range(world_size)]
-        dist.all_gather(gathered, local_padded, group=group)
-        gathered = [g[:n] for g, n in zip(gathered, gathered_lens)]
+        gathered_padded = _all_gather_rank_major(local_padded.contiguous(), group, world_size)
+        gathered = [g[:n] for g, n in zip(gathered_padded.split(max_len, dim=0), gathered_lens)]
 
         ctx.group = group
         ctx.gathered_lens = gathered_lens

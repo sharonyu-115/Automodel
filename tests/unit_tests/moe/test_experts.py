@@ -27,6 +27,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
+    _AllGatherConcatVarlenFn,
     _apply_bias,
     _permute_tokens_for_grouped_mm,
     _scatter_add_fp32_in_chunks,
@@ -35,6 +36,28 @@ from nemo_automodel.components.moe.experts import (
     is_gated_activation,
     swiglu_clamped_deepep,
 )
+
+
+def test_varlen_all_gather_forward_uses_bounded_rank_major_collective(monkeypatch):
+    """The differentiable forward path must not issue one unbounded all-gather."""
+    local = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    remote_padded = torch.tensor([[10.0, 11.0, 12.0], [0.0, 0.0, 0.0]])
+    calls = []
+
+    def fake_gather(local_padded, group, world_size):
+        calls.append((local_padded.clone(), group, world_size))
+        return torch.cat([local_padded, remote_padded], dim=0)
+
+    group = object()
+    monkeypatch.setattr("nemo_automodel.components.moe.experts._all_gather_rank_major", fake_gather)
+    monkeypatch.setattr("nemo_automodel.components.moe.experts.dist.get_rank", lambda _: 0)
+
+    actual = _AllGatherConcatVarlenFn.apply(local, group, [2, 1], 2)
+
+    torch.testing.assert_close(actual, torch.cat([local, remote_padded[:1]], dim=0))
+    assert len(calls) == 1
+    torch.testing.assert_close(calls[0][0], local)
+    assert calls[0][1:] == (group, 2)
 
 
 @pytest.mark.parametrize("weighted", [False, True])
