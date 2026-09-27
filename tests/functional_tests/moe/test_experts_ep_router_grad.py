@@ -36,7 +36,11 @@ from torch.distributed.tensor import Shard, distribute_tensor
 
 import nemo_automodel.components.moe.experts as experts_module
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.experts import GroupedExperts, _ReduceScatterVarlenFn
+from nemo_automodel.components.moe.experts import (
+    GroupedExperts,
+    _ReduceScatterVarlenFn,
+    _ScatterReduceVarlenFn,
+)
 
 _N_EXPERTS = 4
 _TOP_K = 2
@@ -170,6 +174,52 @@ def _reduce_scatter_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
+def _scatter_reduce_worker(rank: int, world_size: int, port: int) -> None:
+    try:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = str(port)
+        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+        # Force multiple feature chunks while covering both grouped-expert
+        # output layouts, uneven per-rank token counts, and duplicate rows.
+        experts_module._MAX_EP_COLLECTIVE_NUMEL = 12
+        features = 5
+        for rows_per_token in (1, _TOP_K):
+            total_rows = sum(_TOKENS_PER_RANK) * rows_per_token
+            destination_rows = torch.tensor(
+                [0, 2, 4, 4] if rank == 0 else [1, 3, total_rows - 1],
+                dtype=torch.long,
+            ).remainder_(total_rows)
+            generator = torch.Generator().manual_seed(100 + rank + rows_per_token)
+            source = torch.randn(destination_rows.numel(), features, generator=generator, requires_grad=True)
+
+            expected_global = torch.zeros(total_rows, features)
+            expected_global.scatter_add_(0, destination_rows[:, None].expand_as(source), source.detach())
+            dist.all_reduce(expected_global)
+
+            actual = _ScatterReduceVarlenFn.apply(
+                source,
+                destination_rows,
+                dist.group.WORLD,
+                list(_TOKENS_PER_RANK),
+                max(_TOKENS_PER_RANK),
+                rows_per_token,
+            )
+            local_start = sum(_TOKENS_PER_RANK[:rank]) * rows_per_token
+            local_rows = _TOKENS_PER_RANK[rank] * rows_per_token
+            expected = expected_global[local_start : local_start + local_rows]
+            if rows_per_token > 1:
+                expected = expected.reshape(_TOKENS_PER_RANK[rank], rows_per_token, features)
+            torch.testing.assert_close(actual, expected)
+
+            actual.square().sum().backward()
+            assert source.grad is not None
+            torch.testing.assert_close(source.grad, 2 * expected_global[destination_rows])
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
 def test_ep_all_gather_propagates_router_weight_gradients():
     mp.spawn(
@@ -181,6 +231,16 @@ def test_ep_all_gather_propagates_router_weight_gradients():
 def test_ep_reduce_scatter_handles_uneven_tokens_and_gradients():
     mp.spawn(
         _reduce_scatter_worker,
+        args=(len(_TOKENS_PER_RANK), _free_port()),
+        nprocs=len(_TOKENS_PER_RANK),
+        join=True,
+    )
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
+def test_ep_sparse_scatter_reduce_handles_layouts_duplicates_and_gradients():
+    mp.spawn(
+        _scatter_reduce_worker,
         args=(len(_TOKENS_PER_RANK), _free_port()),
         nprocs=len(_TOKENS_PER_RANK),
         join=True,

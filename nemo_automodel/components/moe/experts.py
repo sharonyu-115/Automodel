@@ -277,6 +277,88 @@ class _ReduceScatterVarlenFn(Function):
         return grad_input, None, None, None
 
 
+class _ScatterReduceVarlenFn(Function):
+    """Scatter sparse expert rows directly into a bounded reduce-scatter."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        source: torch.Tensor,
+        destination_rows: torch.Tensor,
+        group: dist.ProcessGroup,
+        gathered_lens: list[int],
+        max_len: int,
+        rows_per_token: int,
+    ) -> torch.Tensor:
+        """Combine expert rows without materializing the global dense output."""
+        world_size = len(gathered_lens)
+        rank = dist.get_rank(group)
+        token_to_padded = torch.cat(
+            [
+                torch.arange(length, device=source.device, dtype=torch.long) + source_rank * max_len
+                for source_rank, length in enumerate(gathered_lens)
+            ]
+        )
+        if rows_per_token == 1:
+            padded_destination_rows = token_to_padded[destination_rows]
+        else:
+            token_rows = torch.div(destination_rows, rows_per_token, rounding_mode="floor")
+            slots = destination_rows.remainder(rows_per_token)
+            padded_destination_rows = token_to_padded[token_rows] * rows_per_token + slots
+
+        padded_rows = world_size * max_len * rows_per_token
+        local_padded_rows = max_len * rows_per_token
+        output = torch.empty((local_padded_rows, source.shape[1]), dtype=source.dtype, device=source.device)
+        features_per_chunk = max(1, _MAX_EP_COLLECTIVE_NUMEL // padded_rows)
+        for start in range(0, source.shape[1], features_per_chunk):
+            end = min(start + features_per_chunk, source.shape[1])
+            scatter_input = torch.zeros((padded_rows, end - start), dtype=source.dtype, device=source.device)
+            scatter_index = padded_destination_rows[:, None].expand(-1, end - start)
+            scatter_input.scatter_add_(0, scatter_index, source[:, start:end])
+            output_chunk = torch.empty((local_padded_rows, end - start), dtype=source.dtype, device=source.device)
+            work = dist.reduce_scatter_tensor(
+                output_chunk, scatter_input, op=dist.ReduceOp.SUM, group=group, async_op=True
+            )
+            _wait_for_collective(work, source.device)
+            output[:, start:end].copy_(output_chunk)
+
+        ctx.group = group
+        ctx.gathered_lens = gathered_lens
+        ctx.rank = rank
+        ctx.max_len = max_len
+        ctx.rows_per_token = rows_per_token
+        ctx.source_shape = source.shape
+        ctx.save_for_backward(padded_destination_rows)
+        local_rows = gathered_lens[rank] * rows_per_token
+        local_output = output.narrow(0, 0, local_rows)
+        if rows_per_token == 1:
+            return local_output.contiguous()
+        return local_output.reshape(gathered_lens[rank], rows_per_token, source.shape[1]).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None, None, None, None]:
+        """Gather local token gradients only for this rank's sparse expert rows."""
+        (padded_destination_rows,) = ctx.saved_tensors
+        world_size = len(ctx.gathered_lens)
+        local_padded_rows = ctx.max_len * ctx.rows_per_token
+        padded_rows = world_size * local_padded_rows
+        grad_flat = grad_output.reshape(-1, grad_output.shape[-1])
+        grad_padded = torch.zeros(
+            (local_padded_rows, grad_flat.shape[1]), dtype=grad_output.dtype, device=grad_output.device
+        )
+        grad_padded[: grad_flat.shape[0]].copy_(grad_flat)
+        grad_source = torch.empty(ctx.source_shape, dtype=grad_output.dtype, device=grad_output.device)
+        features_per_chunk = max(1, _MAX_EP_COLLECTIVE_NUMEL // padded_rows)
+        for start in range(0, grad_flat.shape[1], features_per_chunk):
+            end = min(start + features_per_chunk, grad_flat.shape[1])
+            gathered_chunk = torch.empty((padded_rows, end - start), dtype=grad_output.dtype, device=grad_output.device)
+            input_chunk = grad_padded[:, start:end].contiguous()
+            work = dist.all_gather_into_tensor(gathered_chunk, input_chunk, group=ctx.group, async_op=True)
+            _wait_for_collective(work, grad_output.device)
+            grad_source[:, start:end].copy_(gathered_chunk[padded_destination_rows])
+        return grad_source, None, None, None, None, None
+
+
 if TYPE_CHECKING:
     from transformer_engine.pytorch import GroupedLinear
 
@@ -572,7 +654,7 @@ class GroupedExperts(nn.Module):
         experts_end_idx = experts_start_idx + n_local_experts
 
         if self.use_torch_mm:
-            y = self._forward_grouped_mm(
+            y, already_reduce_scattered = self._forward_grouped_mm(
                 x,
                 token_mask,
                 weights,
@@ -583,8 +665,12 @@ class GroupedExperts(nn.Module):
                 down_proj_bias,
                 n_local_experts,
                 experts_start_idx,
+                ep_group if ep_size > 1 else None,
+                gathered_lens if ep_size > 1 else None,
+                max_len if ep_size > 1 else None,
             )
         else:
+            already_reduce_scattered = False
             y = self._forward_loop(
                 x,
                 weights,
@@ -604,7 +690,8 @@ class GroupedExperts(nn.Module):
             y.add_(x.sum(dtype=torch.float32) * 0.0)
 
             # Sum partial expert outputs and return only this rank's original tokens.
-            y = _ReduceScatterVarlenFn.apply(y, ep_group, gathered_lens, max_len)
+            if not already_reduce_scattered:
+                y = _ReduceScatterVarlenFn.apply(y, ep_group, gathered_lens, max_len)
 
         if self.config.apply_router_weight_after_down:
             y = y.sum(dim=1)
@@ -700,6 +787,9 @@ class GroupedExperts(nn.Module):
         down_proj_bias,
         n_local_experts,
         experts_start_idx,
+        ep_group,
+        gathered_lens,
+        max_len,
     ):
         """Grouped GEMM forward path using torch._grouped_mm."""
         (
@@ -760,33 +850,57 @@ class GroupedExperts(nn.Module):
                     use_mxfp8=self.use_mxfp8,
                 )
 
-            # Allocate the global combine buffer only after the expert GEMMs.
-            # For long EP batches it is several GiB, and overlapping it with
-            # the gate/up activation is an avoidable peak-memory cost.
-            y = torch.zeros(output_shape, dtype=x.dtype, device=x.device)
-            if self.config.apply_router_weight_after_down:
-                scatter_ids = sorted_slot_ids.unsqueeze(1).expand_as(output2)
-                _scatter_add_in_chunks(
-                    y.view(-1, x.size(1)),
-                    scatter_ids,
-                    output2,
-                    weights=permuted_probs,
+            if ep_group is not None:
+                rows_per_token = weights.shape[1] if self.config.apply_router_weight_after_down else 1
+                destination_rows = sorted_slot_ids if rows_per_token > 1 else sorted_token_ids
+                source = output2.to(x.dtype)
+                if self.config.apply_router_weight_after_down:
+                    source = source * permuted_probs.to(x.dtype)
+                y = _ScatterReduceVarlenFn.apply(
+                    source,
+                    destination_rows,
+                    ep_group,
+                    gathered_lens,
+                    max_len,
+                    rows_per_token,
                 )
             else:
-                scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
-                _scatter_add_in_chunks(y, scatter_ids, output2)
+                # Allocate the global combine buffer only after the expert GEMMs.
+                y = torch.zeros(output_shape, dtype=x.dtype, device=x.device)
+                if self.config.apply_router_weight_after_down:
+                    scatter_ids = sorted_slot_ids.unsqueeze(1).expand_as(output2)
+                    _scatter_add_in_chunks(
+                        y.view(-1, x.size(1)),
+                        scatter_ids,
+                        output2,
+                        weights=permuted_probs,
+                    )
+                else:
+                    scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
+                    _scatter_add_in_chunks(y, scatter_ids, output2)
         else:
             # Dummy computation for gradient flow
-            y = torch.zeros(output_shape, dtype=x.dtype, device=x.device)
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
             output1_ = self.expert_activation_grouped(output1, weights[0, 0, None].unsqueeze(0))
             output2 = torch.matmul(output1_, down_projs[0])
-            if self.config.apply_router_weight_after_down:
-                y[0, 0] += output2[0]
+            if ep_group is not None:
+                rows_per_token = weights.shape[1] if self.config.apply_router_weight_after_down else 1
+                y = _ScatterReduceVarlenFn.apply(
+                    output2.to(x.dtype) * 0.0,
+                    torch.zeros(1, dtype=torch.long, device=x.device),
+                    ep_group,
+                    gathered_lens,
+                    max_len,
+                    rows_per_token,
+                )
             else:
-                y[0] += output2[0]
+                y = torch.zeros(output_shape, dtype=x.dtype, device=x.device)
+                if self.config.apply_router_weight_after_down:
+                    y[0, 0] += output2[0]
+                else:
+                    y[0] += output2[0]
 
-        return y
+        return y, ep_group is not None
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         self.apply(partial(_init_weights, buffer_device=buffer_device, init_std=init_std))
