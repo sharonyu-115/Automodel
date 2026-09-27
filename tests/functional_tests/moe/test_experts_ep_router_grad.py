@@ -94,9 +94,17 @@ def _global_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Te
     return x, weights, indices, token_mask
 
 
-def _build_experts(config: MoEConfig, *, torch_mm: bool = False) -> GroupedExperts:
+def _build_experts(config: MoEConfig, *, torch_mm: bool = False, replicated_input: bool = False) -> GroupedExperts:
     generator = torch.Generator().manual_seed(4321)
-    backend = BackendConfig(experts="torch_mm", dispatcher="torch") if torch_mm else None
+    backend = (
+        BackendConfig(
+            experts="torch_mm",
+            dispatcher="torch",
+            torch_dispatcher_replicated_input=replicated_input,
+        )
+        if torch_mm or replicated_input
+        else None
+    )
     experts = GroupedExperts(config, backend=backend)
     with torch.no_grad():
         experts.gate_and_up_projs.copy_(torch.randn(experts.gate_and_up_projs.shape, generator=generator) * 0.05)
@@ -328,6 +336,56 @@ def _chunked_extreme_skew_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
+def _replicated_input_worker(rank: int, world_size: int, port: int) -> None:
+    try:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = str(port)
+        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+        x, weights, _, token_mask = _global_inputs()
+        indices = torch.tensor([[0, 1]]).expand(x.shape[0], -1).clone()
+        reference = _build_experts(_tiny_moe_config())
+        reference_x = x.clone().requires_grad_(True)
+        reference_weights = weights.clone().requires_grad_(True)
+        expected = reference(reference_x, token_mask, reference_weights, indices)
+        expected.square().sum().backward()
+
+        ep_mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("ep",))
+        distributed = _build_experts(_tiny_moe_config(), torch_mm=True, replicated_input=True)
+        distributed.gate_and_up_projs = nn.Parameter(
+            distribute_tensor(distributed.gate_and_up_projs.detach(), ep_mesh, [Shard(0)])
+        )
+        distributed.down_projs = nn.Parameter(distribute_tensor(distributed.down_projs.detach(), ep_mesh, [Shard(0)]))
+        local_x = x.clone().requires_grad_(True)
+        local_weights = weights.clone().requires_grad_(True)
+        actual = distributed(local_x, token_mask, local_weights, indices)
+        actual.square().sum().backward()
+
+        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(local_x.grad, reference_x.grad, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(local_weights.grad, reference_weights.grad, rtol=1e-4, atol=1e-5)
+
+        experts_per_rank = _N_EXPERTS // world_size
+        expert_start = rank * experts_per_rank
+        expert_end = expert_start + experts_per_rank
+        for actual_param, reference_param in (
+            (distributed.gate_and_up_projs, reference.gate_and_up_projs),
+            (distributed.down_projs, reference.down_projs),
+        ):
+            assert actual_param.grad is not None
+            assert reference_param.grad is not None
+            actual_grad = actual_param.grad.to_local() if isinstance(actual_param.grad, DTensor) else actual_param.grad
+            torch.testing.assert_close(
+                actual_grad,
+                reference_param.grad[expert_start:expert_end],
+                rtol=1e-4,
+                atol=1e-5,
+            )
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
 def test_ep_all_gather_propagates_router_weight_gradients():
     mp.spawn(
@@ -359,6 +417,16 @@ def test_ep_sparse_scatter_reduce_handles_layouts_duplicates_and_gradients():
 def test_ep_chunked_experts_handle_extreme_routing_skew():
     mp.spawn(
         _chunked_extreme_skew_worker,
+        args=(len(_TOKENS_PER_RANK), _free_port()),
+        nprocs=len(_TOKENS_PER_RANK),
+        join=True,
+    )
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
+def test_ep_replicated_input_avoids_global_activation_gather():
+    mp.spawn(
+        _replicated_input_worker,
         args=(len(_TOKENS_PER_RANK), _free_port()),
         nprocs=len(_TOKENS_PER_RANK),
         join=True,

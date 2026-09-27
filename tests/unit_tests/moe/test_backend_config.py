@@ -95,6 +95,11 @@ class TestBackendConfigExpertsDispatcherValidation:
         assert config.experts == "torch_mm"
         assert config.dispatcher == "torch"
 
+    def test_replicated_input_requires_torch_dispatcher(self):
+        """The replicated-input optimization is specific to the torch dispatcher."""
+        with pytest.raises(ValueError, match="requires dispatcher='torch'"):
+            BackendConfig(dispatcher="deepep", torch_dispatcher_replicated_input=True)
+
     def test_torch_mm_experts_with_deepep_dispatcher_valid(self):
         """Test that torch_mm experts with deepep dispatcher is valid."""
         config = BackendConfig(experts="torch_mm", dispatcher="deepep")

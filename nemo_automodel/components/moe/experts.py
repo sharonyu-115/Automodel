@@ -219,6 +219,35 @@ class _AllGatherConcatVarlenFn(Function):
         return grad_local, None, None, None
 
 
+class _ReplicatedInputFn(Function):
+    """Keep a replicated EP input local and sum its partial expert gradients."""
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+        ctx.group = group
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        grad_input = grad_output.contiguous()
+        dist.all_reduce(grad_input, op=dist.ReduceOp.SUM, group=ctx.group)
+        return grad_input, None
+
+
+class _AllReduceSumFn(Function):
+    """Sum local expert outputs while preserving rank-local expert gradients."""
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+        output = tensor.clone()
+        dist.all_reduce(output, op=dist.ReduceOp.SUM, group=group)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return grad_output, None
+
+
 class _ReduceScatterVarlenFn(Function):
     """Differentiable reduce-scatter for variable per-rank token counts."""
 
@@ -531,6 +560,7 @@ class GroupedExperts(nn.Module):
         # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
         self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
         self.use_mxfp8 = backend is not None and backend.experts == "torch_mm_mxfp8"
+        self.replicated_input = backend is not None and backend.torch_dispatcher_replicated_input
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -627,7 +657,17 @@ class GroupedExperts(nn.Module):
         )
 
         # EP variable-length all-gather
-        if ep_size > 1:
+        replicated_ep = ep_size > 1 and self.replicated_input
+        if replicated_ep:
+            if ep_size != dist.get_world_size():
+                raise RuntimeError(
+                    "torch_dispatcher_replicated_input requires a pure EP process group "
+                    f"({ep_size=} != global world size {dist.get_world_size()})"
+                )
+            ep_group = ep_mesh.get_group()
+            x = _ReplicatedInputFn.apply(x, ep_group)
+            weights = _ReplicatedInputFn.apply(weights, ep_group)
+        elif ep_size > 1:
             ep_group = ep_mesh.get_group()
             local_num_tokens = x.size(0)
 
@@ -678,9 +718,10 @@ class GroupedExperts(nn.Module):
                 down_proj_bias,
                 n_local_experts,
                 experts_start_idx,
-                ep_group if ep_size > 1 else None,
-                gathered_lens if ep_size > 1 else None,
-                max_len if ep_size > 1 else None,
+                ep_group if ep_size > 1 and not replicated_ep else None,
+                gathered_lens if ep_size > 1 and not replicated_ep else None,
+                max_len if ep_size > 1 and not replicated_ep else None,
+                force_matmul_backward=replicated_ep,
             )
         else:
             already_reduce_scattered = False
@@ -698,7 +739,9 @@ class GroupedExperts(nn.Module):
                 experts_end_idx,
             )
 
-        if ep_size > 1:
+        if replicated_ep:
+            y = _AllReduceSumFn.apply(y, ep_group)
+        elif ep_size > 1:
             # Sum partial expert outputs and return only this rank's original tokens.
             if not already_reduce_scattered:
                 # Keep the differentiable activation gather attached on the
@@ -803,6 +846,8 @@ class GroupedExperts(nn.Module):
         ep_group,
         gathered_lens,
         max_len,
+        *,
+        force_matmul_backward=False,
     ):
         """Grouped GEMM forward path using torch._grouped_mm."""
         (
@@ -873,19 +918,30 @@ class GroupedExperts(nn.Module):
                     None if self.config.apply_router_weight_after_down else permuted_probs,
                 )
             else:
-                output2 = _torch_mm_experts_fwd(
-                    # Do not retain a second reference to the multi-GiB
-                    # permuted input in this frame. The helper releases its
-                    # temporary after the up projection, before allocating the
-                    # routed activation and down-projection output.
-                    x[sorted_token_ids],
-                    gate_and_up_projs,
-                    down_projs,
-                    tokens_per_expert,
-                    activation_probs,
-                    self.expert_activation_grouped,
-                    use_mxfp8=self.use_mxfp8,
-                )
+                expert_input = x[sorted_token_ids]
+                if torch.is_grad_enabled() and force_matmul_backward:
+                    output2 = _matmul_experts_fwd(
+                        expert_input,
+                        gate_and_up_projs,
+                        down_projs,
+                        tokens_per_expert,
+                        activation_probs,
+                        self.expert_activation_grouped,
+                    )
+                else:
+                    output2 = _torch_mm_experts_fwd(
+                        # Do not retain a second reference to the multi-GiB
+                        # permuted input in this frame. The helper releases its
+                        # temporary after the up projection, before allocating
+                        # the routed activation and down-projection output.
+                        expert_input,
+                        gate_and_up_projs,
+                        down_projs,
+                        tokens_per_expert,
+                        activation_probs,
+                        self.expert_activation_grouped,
+                        use_mxfp8=self.use_mxfp8,
+                    )
 
             if ep_group is not None:
                 rows_per_token = weights.shape[1] if self.config.apply_router_weight_after_down else 1
