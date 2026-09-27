@@ -50,6 +50,12 @@ _MAX_EP_COLLECTIVE_NUMEL = 1 << 22
 # activation-checkpoint recompute.
 _MAX_SCATTER_NUMEL = 1 << 26
 
+# Bound each inference-only grouped GEMM to 128 MiB of BF16 input/output at
+# Inkling's 4096-wide routed projections. Router correction biases can send a
+# majority of a long EP batch to one expert, so a token-count microbatch limit
+# is required in addition to feature-chunked activation and collectives.
+_MAX_GROUPED_MM_ROWS = 1 << 14
+
 
 def _scatter_add_in_chunks(
     target: torch.Tensor,
@@ -811,6 +817,25 @@ class GroupedExperts(nn.Module):
             (x.shape[0], weights.shape[1], x.shape[1]) if self.config.apply_router_weight_after_down else x.shape
         )
 
+        if ep_group is not None and not self.expert_bias and not torch.is_grad_enabled():
+            y = _torch_mm_experts_chunked_inference(
+                x,
+                sorted_token_ids,
+                sorted_slot_ids,
+                sorted_weights,
+                offs,
+                gate_and_up_projs,
+                down_projs,
+                self.expert_activation_grouped,
+                ep_group,
+                gathered_lens,
+                max_len,
+                weights.shape[1] if self.config.apply_router_weight_after_down else 1,
+                self.config.apply_router_weight_after_down,
+                use_mxfp8=self.use_mxfp8,
+            )
+            return y, True
+
         if sorted_token_ids.numel() > 0:
             permuted_probs = sorted_weights.unsqueeze(-1)
             activation_probs = (
@@ -1284,6 +1309,81 @@ def _torch_mm_experts_fwd(
     output1 = activation_fn(output1, permuted_probs)
     output2 = grouped_mm(output1, down_projs, offs)
     return output2
+
+
+def _torch_mm_experts_chunked_inference(
+    x: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    sorted_slot_ids: torch.Tensor,
+    sorted_weights: torch.Tensor,
+    offs: torch.Tensor,
+    gate_and_up_projs: torch.Tensor,
+    down_projs: torch.Tensor,
+    activation_fn: Any,
+    ep_group: dist.ProcessGroup,
+    gathered_lens: list[int],
+    max_len: int,
+    rows_per_token: int,
+    apply_router_weight_after_down: bool,
+    *,
+    use_mxfp8: bool,
+) -> torch.Tensor:
+    """Run skewed EP expert inference without materializing all routed rows."""
+    local_rows = sorted_token_ids.numel()
+    max_rows_tensor = torch.tensor(local_rows, dtype=torch.int64, device=x.device)
+    dist.all_reduce(max_rows_tensor, op=dist.ReduceOp.MAX, group=ep_group)
+    max_rows = int(max_rows_tensor.item())
+    expert_starts = torch.cat([offs.new_zeros(1), offs[:-1]])
+    y = None
+
+    # Every EP rank executes the same number of reduce-scatter calls. Ranks
+    # with fewer routed rows contribute an empty source for later rounds.
+    for start in range(0, max(1, max_rows), _MAX_GROUPED_MM_ROWS):
+        local_end = min(start + _MAX_GROUPED_MM_ROWS, local_rows)
+        if start < local_end:
+            end_tensor = offs.new_tensor(local_end)
+            start_tensor = offs.new_tensor(start)
+            chunk_tokens_per_expert = (
+                torch.minimum(offs, end_tensor) - torch.maximum(expert_starts, start_tensor)
+            ).clamp_min_(0)
+            activation_probs = sorted_weights[start:local_end].unsqueeze(-1)
+            if apply_router_weight_after_down:
+                activation_probs = torch.ones_like(activation_probs)
+            output2 = _torch_mm_experts_fwd(
+                x[sorted_token_ids[start:local_end]],
+                gate_and_up_projs,
+                down_projs,
+                chunk_tokens_per_expert,
+                activation_probs,
+                activation_fn,
+                use_mxfp8=use_mxfp8,
+            )
+            destination_rows = (
+                sorted_slot_ids[start:local_end] if rows_per_token > 1 else sorted_token_ids[start:local_end]
+            )
+            source = output2.to(x.dtype)
+            if apply_router_weight_after_down:
+                source = source * sorted_weights[start:local_end, None].to(x.dtype)
+        else:
+            source = x.new_empty((0, x.shape[1]))
+            destination_rows = sorted_token_ids.new_empty((0,))
+
+        partial_y = _ScatterReduceVarlenFn.apply(
+            source,
+            destination_rows,
+            ep_group,
+            gathered_lens,
+            max_len,
+            rows_per_token,
+        )
+        if y is None:
+            y = partial_y
+        else:
+            y.add_(partial_y)
+
+    if y is None:
+        raise RuntimeError("Chunked grouped expert inference produced no collective rounds")
+    return y
 
 
 class GroupedExpertsTE(nn.Module):

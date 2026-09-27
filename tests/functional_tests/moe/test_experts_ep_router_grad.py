@@ -220,6 +220,39 @@ def _scatter_reduce_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
+def _chunked_inference_worker(rank: int, world_size: int, port: int) -> None:
+    try:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = str(port)
+        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+        x, weights, _, token_mask = _global_inputs()
+        # Route every token to rank 0's experts. Rank 1 must still participate
+        # in every empty-source collective round.
+        indices = torch.tensor([[0, 1]]).expand(x.shape[0], -1).clone()
+        reference = _build_experts(_tiny_moe_config())
+        with torch.no_grad():
+            expected = reference(x, token_mask, weights, indices)
+
+        ep_mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("ep",))
+        distributed = _build_experts(_tiny_moe_config())
+        distributed.gate_and_up_projs = nn.Parameter(
+            distribute_tensor(distributed.gate_and_up_projs.detach(), ep_mesh, [Shard(0)])
+        )
+        distributed.down_projs = nn.Parameter(distribute_tensor(distributed.down_projs.detach(), ep_mesh, [Shard(0)]))
+        experts_module._MAX_GROUPED_MM_ROWS = 2
+        start = sum(_TOKENS_PER_RANK[:rank])
+        end = start + _TOKENS_PER_RANK[rank]
+
+        with torch.no_grad():
+            actual = distributed(x[start:end], token_mask[start:end], weights[start:end], indices[start:end])
+
+        torch.testing.assert_close(actual, expected[start:end], rtol=1e-4, atol=1e-5)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
 def test_ep_all_gather_propagates_router_weight_gradients():
     mp.spawn(
@@ -241,6 +274,16 @@ def test_ep_reduce_scatter_handles_uneven_tokens_and_gradients():
 def test_ep_sparse_scatter_reduce_handles_layouts_duplicates_and_gradients():
     mp.spawn(
         _scatter_reduce_worker,
+        args=(len(_TOKENS_PER_RANK), _free_port()),
+        nprocs=len(_TOKENS_PER_RANK),
+        join=True,
+    )
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
+def test_ep_chunked_inference_handles_extreme_routing_skew():
+    mp.spawn(
+        _chunked_inference_worker,
         args=(len(_TOKENS_PER_RANK), _free_port()),
         nprocs=len(_TOKENS_PER_RANK),
         join=True,
