@@ -36,6 +36,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
 import nemo_automodel.components.moe.experts as experts_module
+from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
@@ -93,9 +94,10 @@ def _global_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Te
     return x, weights, indices, token_mask
 
 
-def _build_experts(config: MoEConfig) -> GroupedExperts:
+def _build_experts(config: MoEConfig, *, torch_mm: bool = False) -> GroupedExperts:
     generator = torch.Generator().manual_seed(4321)
-    experts = GroupedExperts(config)
+    backend = BackendConfig(experts="torch_mm", dispatcher="torch") if torch_mm else None
+    experts = GroupedExperts(config, backend=backend)
     with torch.no_grad():
         experts.gate_and_up_projs.copy_(torch.randn(experts.gate_and_up_projs.shape, generator=generator) * 0.05)
         experts.down_projs.copy_(torch.randn(experts.down_projs.shape, generator=generator) * 0.05)
@@ -284,10 +286,18 @@ def _chunked_extreme_skew_worker(rank: int, world_size: int, port: int) -> None:
         torch.testing.assert_close(actual, expected[start:end], rtol=1e-4, atol=1e-5)
 
         reference.zero_grad(set_to_none=True)
-        distributed.zero_grad(set_to_none=True)
         reference_weights = weights.clone().requires_grad_(True)
         expected = reference(x, token_mask, reference_weights, indices)
         expected.sum().backward()
+
+        # Exercise the production chunked torch_mm dispatch. Its grad-enabled
+        # path uses bounded per-expert matmuls because grouped_mm backward can
+        # stall on GB200 when a skewed chunk contains empty expert groups.
+        distributed = _build_experts(_tiny_moe_config(), torch_mm=True)
+        distributed.gate_and_up_projs = nn.Parameter(
+            distribute_tensor(distributed.gate_and_up_projs.detach(), ep_mesh, [Shard(0)])
+        )
+        distributed.down_projs = nn.Parameter(distribute_tensor(distributed.down_projs.detach(), ep_mesh, [Shard(0)]))
         local_weights = weights[start:end].clone().requires_grad_(True)
         actual = distributed(x[start:end], token_mask[start:end], local_weights, indices[start:end])
         actual.sum().backward()

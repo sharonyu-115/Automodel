@@ -699,11 +699,11 @@ class GroupedExperts(nn.Module):
             )
 
         if ep_size > 1:
-            # Keep the differentiable all-gather path attached to x without materializing a full-size zero tensor.
-            y.add_(x.sum(dtype=torch.float32) * 0.0)
-
             # Sum partial expert outputs and return only this rank's original tokens.
             if not already_reduce_scattered:
+                # Keep the differentiable activation gather attached on the
+                # dense-output expert path even when no expert is active.
+                y.add_(x.sum(dtype=torch.float32) * 0.0)
                 y = _ReduceScatterVarlenFn.apply(y, ep_group, gathered_lens, max_len)
 
         if self.config.apply_router_weight_after_down:
@@ -1318,6 +1318,37 @@ def _torch_mm_experts_fwd(
     return output2
 
 
+def _matmul_experts_fwd(
+    hidden_states: torch.Tensor,
+    gate_and_up_projs: torch.Tensor,
+    down_projs: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    permuted_probs: torch.Tensor,
+    activation_fn: Any,
+) -> torch.Tensor:
+    """Run a bounded training chunk without grouped-matmul backward.
+
+    ``torch._grouped_mm`` backward can indefinitely spin on GB200 when a
+    heavily skewed chunk contains empty expert groups. EP128 leaves only two
+    experts per Inkling rank, so ordinary per-expert matmuls retain the same
+    bounded activations with negligible dispatch overhead.
+    """
+    token_counts = tokens_per_expert.tolist()
+    hidden_chunks = hidden_states.split(token_counts, dim=0)
+    prob_chunks = permuted_probs.split(token_counts, dim=0)
+    outputs = []
+    for expert_idx, (hidden_chunk, prob_chunk) in enumerate(zip(hidden_chunks, prob_chunks)):
+        if hidden_chunk.shape[0] == 0:
+            continue
+        output1 = torch.matmul(hidden_chunk, gate_and_up_projs[expert_idx])
+        output1 = activation_fn(output1, prob_chunk)
+        outputs.append(torch.matmul(output1, down_projs[expert_idx]))
+
+    if not outputs:
+        raise RuntimeError("Expected at least one routed row in an expert training chunk")
+    return torch.cat(outputs, dim=0)
+
+
 def _torch_mm_experts_chunked(
     x: torch.Tensor,
     sorted_token_ids: torch.Tensor,
@@ -1356,15 +1387,25 @@ def _torch_mm_experts_chunked(
             activation_probs = sorted_weights[start:local_end].unsqueeze(-1)
             if apply_router_weight_after_down:
                 activation_probs = torch.ones_like(activation_probs)
-            output2 = _torch_mm_experts_fwd(
-                x[sorted_token_ids[start:local_end]],
-                gate_and_up_projs,
-                down_projs,
-                chunk_tokens_per_expert,
-                activation_probs,
-                activation_fn,
-                use_mxfp8=use_mxfp8,
-            )
+            if torch.is_grad_enabled():
+                output2 = _matmul_experts_fwd(
+                    x[sorted_token_ids[start:local_end]],
+                    gate_and_up_projs,
+                    down_projs,
+                    chunk_tokens_per_expert,
+                    activation_probs,
+                    activation_fn,
+                )
+            else:
+                output2 = _torch_mm_experts_fwd(
+                    x[sorted_token_ids[start:local_end]],
+                    gate_and_up_projs,
+                    down_projs,
+                    chunk_tokens_per_expert,
+                    activation_probs,
+                    activation_fn,
+                    use_mxfp8=use_mxfp8,
+                )
             destination_rows = (
                 sorted_slot_ids[start:local_end] if rows_per_token > 1 else sorted_token_ids[start:local_end]
             )
@@ -1377,20 +1418,28 @@ def _torch_mm_experts_chunked(
             # expert shard to produce a (possibly all-zero) gradient.
             dummy_tokens_per_expert = torch.zeros_like(offs)
             dummy_tokens_per_expert[0] = 1
-            output2 = _torch_mm_experts_fwd(
+            output2 = _matmul_experts_fwd(
                 x[:1] * 0.0,
                 gate_and_up_projs,
                 down_projs,
                 dummy_tokens_per_expert,
                 sorted_weights.new_ones((1, 1)),
                 activation_fn,
-                use_mxfp8=use_mxfp8,
             )
             source = output2.to(x.dtype) * 0.0
             destination_rows = sorted_token_ids.new_zeros((1,))
         else:
             source = x.new_empty((0, x.shape[1]))
             destination_rows = sorted_token_ids.new_empty((0,))
+
+        if torch.is_grad_enabled():
+            # Attach both gathered inputs to every collective round, including
+            # empty rounds. This keeps their gather-backward collectives after
+            # all scatter-backward collectives on every rank despite routing
+            # skew; a single dependency after the loop can become ready early
+            # on empty ranks and reorder collectives.
+            graph_dependency = (x.sum(dtype=torch.float32) + sorted_weights.sum(dtype=torch.float32)) * 0.0
+            source = source + graph_dependency.to(source.dtype)
 
         partial_y = _ScatterReduceVarlenFn.apply(
             source,
