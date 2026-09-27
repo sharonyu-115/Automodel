@@ -838,7 +838,9 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     assert experts_call is not None
     _, experts_kwargs = experts_call
     assert experts_kwargs["mesh"] is ep_shard_mesh
-    assert experts_kwargs["reshard_after_forward"] is False
+    # CPU offload must evict expert weights after forward even when the caller's
+    # general reshard policy is false.
+    assert experts_kwargs["reshard_after_forward"] is True
     assert experts_kwargs["offload_policy"] is offload_policy
     assert experts_kwargs["mp_policy"] == ("INTERNAL_MP_POLICY", "MP_POLICY")
     assert callable(experts_kwargs["shard_placement_fn"])  # lambda _: Shard(1)
@@ -894,6 +896,7 @@ def test_apply_fsdp_wraps_size_one_expert_mesh_for_cpu_offload(monkeypatch):
     _, experts_kwargs = experts_call
     assert experts_kwargs["mesh"] is ep_shard_mesh
     assert experts_kwargs["offload_policy"] is offload_policy
+    assert experts_kwargs["reshard_after_forward"] is True
 
 
 def test_apply_fsdp_installs_accumulated_grad_guard(monkeypatch):
