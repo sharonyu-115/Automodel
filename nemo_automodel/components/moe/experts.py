@@ -812,13 +812,13 @@ class GroupedExperts(nn.Module):
         )
 
         if sorted_token_ids.numel() > 0:
-            permuted_x = x[sorted_token_ids]
             permuted_probs = sorted_weights.unsqueeze(-1)
             activation_probs = (
                 torch.ones_like(permuted_probs) if self.config.apply_router_weight_after_down else permuted_probs
             )
 
             if self.expert_bias:
+                permuted_x = x[sorted_token_ids]
                 # torch._grouped_mm does not support bias yet (raises
                 # "RuntimeError: Bias not supported yet" as of PyTorch 2.10).
                 # Apply bias manually after each grouped GEMM via _apply_bias.
@@ -830,6 +830,7 @@ class GroupedExperts(nn.Module):
                 # v0.17.0 has no bias arg). bf16 path byte-identical.
                 grouped_mm = select_grouped_mm(self.use_mxfp8)
                 output1 = grouped_mm(permuted_x, gate_and_up_projs, offs)
+                del permuted_x
                 output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
                 output1 = self.expert_activation_grouped(output1, activation_probs)
                 output2 = grouped_mm(output1, down_projs, offs)
@@ -841,7 +842,11 @@ class GroupedExperts(nn.Module):
                 )
             else:
                 output2 = _torch_mm_experts_fwd(
-                    permuted_x,
+                    # Do not retain a second reference to the multi-GiB
+                    # permuted input in this frame. The helper releases its
+                    # temporary after the up projection, before allocating the
+                    # routed activation and down-projection output.
+                    x[sorted_token_ids],
                     gate_and_up_projs,
                     down_projs,
                     tokens_per_expert,
@@ -1270,6 +1275,12 @@ def _torch_mm_experts_fwd(
     offs = tokens_per_expert.cumsum(dim=0).to(torch.int32)
     grouped_mm = select_grouped_mm(use_mxfp8)
     output1 = grouped_mm(hidden_states, gate_and_up_projs, offs)
+    # Long, skewed EP batches can make the permuted input several GiB. It is
+    # no longer needed after the up projection and otherwise overlaps the full
+    # activation/output allocations during inference. Autograd retains any
+    # storage it needs for backward; this primarily shortens the no-grad and
+    # activation-checkpoint-forward lifetime.
+    del hidden_states
     output1 = activation_fn(output1, permuted_probs)
     output2 = grouped_mm(output1, down_projs, offs)
     return output2

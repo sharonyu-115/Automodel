@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.util
+import weakref
 from unittest.mock import Mock, patch
 
 import pytest
@@ -2279,6 +2280,47 @@ class TestTorchMMExpertsFwd:
 
         assert output.shape == (total_tokens, dim)
         assert not torch.isnan(output).any()
+
+    def test_releases_temporary_input_before_activation(self, monkeypatch):
+        """The permuted input does not overlap activation allocation in no-grad."""
+        input_ref = None
+        call_count = 0
+
+        def fake_grouped_mm(lhs, rhs, _offs):
+            nonlocal call_count, input_ref
+            call_count += 1
+            if call_count == 1:
+                input_ref = weakref.ref(lhs)
+            return torch.zeros(lhs.shape[0], rhs.shape[-1], dtype=lhs.dtype)
+
+        def activation(output, probs):
+            assert input_ref is not None
+            assert input_ref() is None
+            return output[:, :4] * probs
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.experts.select_grouped_mm",
+            lambda _use_mxfp8: fake_grouped_mm,
+        )
+        source = torch.randn(6, 4)
+        token_ids = torch.tensor([4, 1, 3, 0, 5, 2])
+        gate_up = torch.randn(2, 4, 8)
+        down = torch.randn(2, 4, 4)
+        tokens_per_expert = torch.tensor([3, 3])
+        probs = torch.rand(6, 1)
+
+        with torch.no_grad():
+            output = _torch_mm_experts_fwd(
+                source[token_ids],
+                gate_up,
+                down,
+                tokens_per_expert,
+                probs,
+                activation,
+            )
+
+        assert call_count == 2
+        assert output.shape == source.shape
 
 
 class TestGroupedExpertsConvergenceFixes:
