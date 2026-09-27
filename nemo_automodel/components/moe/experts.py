@@ -175,13 +175,20 @@ class _AllGatherConcatVarlenFn(Function):
 
         world_size = len(gathered_lens)
         gathered_padded = _all_gather_rank_major(local_padded.contiguous(), group, world_size)
-        gathered = [g[:n] for g, n in zip(gathered_padded.split(max_len, dim=0), gathered_lens)]
+        if all(length == max_len for length in gathered_lens):
+            # The rank-major gather already has the exact concatenated layout.
+            # Avoid duplicating the full EP activation with torch.cat; for a
+            # long EP128 Inkling batch this copy alone is more than 4 GiB.
+            gathered = gathered_padded
+        else:
+            gathered_chunks = [g[:n] for g, n in zip(gathered_padded.split(max_len, dim=0), gathered_lens)]
+            gathered = torch.cat(gathered_chunks, dim=0)
 
         ctx.group = group
         ctx.gathered_lens = gathered_lens
         ctx.rank = dist.get_rank(group)
         ctx.max_len = max_len
-        return torch.cat(gathered, dim=0)
+        return gathered
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:

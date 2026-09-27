@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import socket
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -38,6 +39,7 @@ import nemo_automodel.components.moe.experts as experts_module
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
+    _AllGatherConcatVarlenFn,
     _ReduceScatterVarlenFn,
     _ScatterReduceVarlenFn,
 )
@@ -98,6 +100,18 @@ def _build_experts(config: MoEConfig) -> GroupedExperts:
         experts.gate_and_up_projs.copy_(torch.randn(experts.gate_and_up_projs.shape, generator=generator) * 0.05)
         experts.down_projs.copy_(torch.randn(experts.down_projs.shape, generator=generator) * 0.05)
     return experts
+
+
+def test_equal_length_all_gather_reuses_rank_major_storage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Equal-length EP ranks must not duplicate the full gathered activation."""
+    gathered = torch.randn(4, _DIM)
+    monkeypatch.setattr(experts_module, "_all_gather_rank_major", lambda *_args: gathered)
+    monkeypatch.setattr(dist, "get_rank", lambda _group: 0)
+
+    ctx = SimpleNamespace()
+    actual = _AllGatherConcatVarlenFn.forward(ctx, torch.randn(2, _DIM), object(), [2, 2], 2)
+
+    assert actual is gathered
 
 
 def _reference_forward_backward() -> tuple[torch.Tensor, torch.Tensor]:
