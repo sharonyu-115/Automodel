@@ -32,7 +32,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
-_INKLING_SWIGLU_CHUNK_BYTES = 128 * 1024 * 1024
+_INKLING_SWIGLU_CHUNK_BYTES = 64 * 1024 * 1024
 
 
 def _mask_padding_states(hidden_states: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
