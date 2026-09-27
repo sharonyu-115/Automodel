@@ -720,7 +720,6 @@ class GroupedExperts(nn.Module):
         output_shape = (
             (x.shape[0], weights.shape[1], x.shape[1]) if self.config.apply_router_weight_after_down else x.shape
         )
-        y = torch.zeros(output_shape, dtype=x.dtype, device=x.device)
 
         if sorted_token_ids.numel() > 0:
             permuted_x = x[sorted_token_ids]
@@ -761,6 +760,10 @@ class GroupedExperts(nn.Module):
                     use_mxfp8=self.use_mxfp8,
                 )
 
+            # Allocate the global combine buffer only after the expert GEMMs.
+            # For long EP batches it is several GiB, and overlapping it with
+            # the gate/up activation is an avoidable peak-memory cost.
+            y = torch.zeros(output_shape, dtype=x.dtype, device=x.device)
             if self.config.apply_router_weight_after_down:
                 scatter_ids = sorted_slot_ids.unsqueeze(1).expand_as(output2)
                 _scatter_add_in_chunks(
@@ -774,6 +777,7 @@ class GroupedExperts(nn.Module):
                 _scatter_add_in_chunks(y, scatter_ids, output2)
         else:
             # Dummy computation for gradient flow
+            y = torch.zeros(output_shape, dtype=x.dtype, device=x.device)
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
             output1_ = self.expert_activation_grouped(output1, weights[0, 0, None].unsqueeze(0))
             output2 = torch.matmul(output1_, down_projs[0])
